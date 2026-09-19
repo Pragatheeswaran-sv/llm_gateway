@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from src.config import settings
+from src.conversation.api import router as conversation_router
 from src.database import init_db
 from src.register_application.api import router as application_router
 
@@ -21,6 +22,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(application_router)
+app.include_router(conversation_router)
 
 
 @app.exception_handler(HTTPException)
