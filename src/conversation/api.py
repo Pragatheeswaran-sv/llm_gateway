@@ -9,10 +9,7 @@ from src.conversation.service import validate_access_token, generate_sql
 from src.database import get_db
 
 
-router = APIRouter(
-    prefix="/api/v1/sql",
-    tags=["SQL"]
-)
+router = APIRouter( prefix="/api/v1", tags=["SQL"])
 
 
 @router.post("/generate", response_model=SQLGenerateResponse)

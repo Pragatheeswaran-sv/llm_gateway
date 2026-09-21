@@ -70,14 +70,26 @@ def get_session(conversation_id: str):
 
 
 def call_llm(ai: str, model: str, api_key: str, system_prompt: str, user_prompt: str):
-    if ai.lower() == "groq":
+    provider = ai.strip().lower()
+
+    if provider == "groq":
         client = OpenAI(
             api_key=api_key,
             base_url="https://api.groq.com/openai/v1"
         )
-    elif ai.lower() == "openai":
+    elif provider == "openai":
         client = OpenAI(
             api_key=api_key
+        )
+    elif provider in {"freellmapi", "auto", "free-llm-api.com"}:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="http://host.docker.internal:31415/v1"
+        )
+    elif provider in {"gemini", "google", "googlegemini"}:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
         )
     else:
         raise ValueError(f"Unsupported AI provider: {ai}")
