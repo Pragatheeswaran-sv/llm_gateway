@@ -1,30 +1,22 @@
+import os
 from pathlib import Path
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from dotenv import load_dotenv
 
 
-# src/config.py -> project root is one directory above src/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
 
-
-class Settings(BaseSettings):
-    APP_NAME: str = "LLM Gateway"
-    DATABASE_URL: str
-
-    JWT_SECRET_KEY: str
-    JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-
-    # Keep this stable. Changing it invalidates existing client-secret hashes.
-    CLIENT_SECRET_HASH_PEPPER: str
-
-    model_config = SettingsConfigDict(
-        env_file=ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
+load_dotenv(ENV_FILE)
 
 
-settings = Settings()  # type: ignore[call-arg]
+class Settings:
+    APP_NAME = os.getenv( "APP_NAME", "LLM Gateway")
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+    JWT_ALGORITHM = os.getenv( "JWT_ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+    CLIENT_SECRET_HASH_PEPPER = os.getenv("CLIENT_SECRET_HASH_PEPPER")
+
+
+settings = Settings()
