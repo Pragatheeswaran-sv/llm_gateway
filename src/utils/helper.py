@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,73 @@ from src.config import settings
 
 class AccessTokenError(ValueError):
     pass
+
+
+def clean_dbml(dbml: str) -> str:
+    dbml = dbml.strip()
+
+    if dbml.startswith("```"):
+        lines = [
+            line
+            for line in dbml.splitlines()
+            if not line.strip().startswith("```")
+        ]
+        dbml = "\n".join(lines).strip()
+
+    lines = [line.strip() for line in dbml.splitlines() if line.strip()]
+    flattened = []
+    table_lines = []
+
+    for line in lines:
+        table_lines.append(line)
+        if line == "}":
+            table_name = table_lines[0].rstrip("{").strip()
+            columns = table_lines[1:-1]
+            flattened.append(f"{table_name} {{{', '.join(columns)}}}")
+            table_lines = []
+
+    if table_lines:
+        flattened.extend(table_lines)
+
+    dbml = " ".join(flattened).strip()
+
+    return dbml
+
+
+def validate_dbml(dbml: str) -> bool:
+    if not dbml:
+        return False
+
+    normalized = clean_dbml(dbml)
+    return "Table " in normalized and "{" in normalized and "}" in normalized
+
+
+def parse_dbml_response(response: str) -> dict[str, str]:
+    response = response.strip()
+    if "```" in response:
+        raise ValueError("Invalid DBML response format from LLM.")
+
+    match = re.fullmatch(
+        r"\s*DBML:\s*\n(?P<dbml>.*?)\n\s*SUMMARY:\s*\n"
+        r"(?P<summary>.*?)\n\s*EXPLANATION:\s*\n(?P<explanation>.+?)\s*",
+        response,
+        flags=re.DOTALL,
+    )
+    if not match:
+        raise ValueError("Invalid DBML response format from LLM.")
+
+    dbml = clean_dbml(match.group("dbml"))
+    summary = match.group("summary").strip()
+    explanation = match.group("explanation").strip()
+
+    if not validate_dbml(dbml) or not summary or not explanation:
+        raise ValueError("Invalid DBML response from LLM.")
+
+    return {
+        "dbml_query": dbml,
+        "updated_summary": summary,
+        "explanation": explanation,
+    }
 
 
 def generate_client_id() -> str:

@@ -2,19 +2,20 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from src.conversation.schemas import (
-    SQLGenerateRequest,
-    SQLGenerateResponse,
+    DBMLGenerateData,
+    DBMLGenerateRequest,
+    DBMLGenerateResponse,
 )
-from src.conversation.service import validate_access_token, generate_sql
+from src.conversation.service import validate_access_token, generate_dbml
 from src.database import get_db
 
 
-router = APIRouter( prefix="/api/v1", tags=["SQL"])
+router = APIRouter(prefix="/api/v1", tags=["DBML"])
 
 
-@router.post("/generate", response_model=SQLGenerateResponse)
-def generate_sql_endpoint(
-    request: SQLGenerateRequest,
+@router.post("/generate", response_model=DBMLGenerateResponse)
+def generate_dbml_endpoint(
+    request: DBMLGenerateRequest,
     authorization: str | None = Header(default=None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
@@ -34,18 +35,22 @@ def generate_sql_endpoint(
         ) from exc
 
     try:
-        result = generate_sql(
-            db=db,
-            app_id=app.id,
-            conversation_id=request.conversation_id,
+        result = generate_dbml(
             user_query=request.user_query,
             ai=request.model,
             model=request.llm,
             api_key=request.llm_api_key,
-            external_prompt_id=request.external_prompt_id,
+            base_url=request.base_url,
+            enable_summary=request.enable_summary,
+            summary=request.summary if request.enable_summary else "",
+            dbml=request.dbml,
         )
 
-        return SQLGenerateResponse(data=result)
+        return DBMLGenerateResponse(
+            message="DBML generated successfully",
+            status_code=status.HTTP_200_OK,
+            data=DBMLGenerateData(**result),
+        )
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

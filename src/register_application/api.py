@@ -17,7 +17,7 @@ from src.register_application.service import (
 )
 
 
-router = APIRouter(prefix="/api", tags=["Application"])
+router = APIRouter(prefix="/api/v1", tags=["Application"])
 
 
 @router.post(
