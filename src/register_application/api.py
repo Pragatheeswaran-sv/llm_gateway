@@ -17,7 +17,7 @@ from src.register_application.service import (
 )
 
 
-router = APIRouter(prefix="/app", tags=["Application"])
+router = APIRouter(prefix="/api/v1", tags=["Application"])
 
 
 @router.post(
@@ -32,8 +32,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     return {
-        "status": "success",
-        "code": status.HTTP_201_CREATED,
+        "msg": "application registered successfully",
+        "status": status.HTTP_201_CREATED,
         "data": {
             "client_id": application.client_id,
             "client_secret_key": raw_secret,
@@ -54,8 +54,8 @@ def token(payload: TokenRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
     return {
-        "status": "success",
-        "code": status.HTTP_200_OK,
+        "msg": "Token issued successfully",
+        "status": status.HTTP_200_OK,
         "data": {
             "access_token": access_token,
             "time_expires": expires_at,

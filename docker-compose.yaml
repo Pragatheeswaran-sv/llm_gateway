@@ -1,6 +1,8 @@
 services:
   fastapi:
-    build: .
+    build:
+      context: .
+      dockerfile: dockerfile
     container_name: fastapi_llm_gateway
     ports:
       - "8000:8000"
@@ -8,4 +10,4 @@ services:
       - .env
     volumes:
       - .:/app
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    command: poetry run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
