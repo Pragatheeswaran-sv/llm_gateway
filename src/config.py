@@ -1,4 +1,11 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# src/config.py -> project root is one directory above src/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ENV_FILE = PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -13,11 +20,11 @@ class Settings(BaseSettings):
     CLIENT_SECRET_HASH_PEPPER: str
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
+        case_sensitive=False,
     )
 
 
-# BaseSettings loads required values from .env or the process environment.
 settings = Settings()  # type: ignore[call-arg]

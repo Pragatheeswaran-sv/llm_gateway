@@ -1,15 +1,15 @@
 from datetime import datetime
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 T = TypeVar("T")
 
 
 class ApiResponse(BaseModel, Generic[T]):
-    status: str
-    code: int
+    msg: str
+    status: int
     data: T
 
 
@@ -39,6 +39,7 @@ class RegisterData(BaseModel):
     client_secret_key: str
 
 
+
 class TokenRequest(BaseModel):
     client_id: str = Field(min_length=1, max_length=255)
     client_secret_key: str = Field(min_length=1, max_length=1000, repr=False)
@@ -54,4 +55,4 @@ class TokenRequest(BaseModel):
 
 class TokenData(BaseModel):
     access_token: str
-    
+    time_expires: datetime

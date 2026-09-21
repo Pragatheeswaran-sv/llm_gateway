@@ -1,5 +1,4 @@
 .env
-.env.example
 .venv/
 venv/
 __pycache__/
@@ -10,3 +9,4 @@ htmlcov/
 .idea/
 .vscode/
 .kilo
+alembic/

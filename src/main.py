@@ -5,13 +5,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from src.config import settings
-from src.database import init_db
 from src.register_application.api import router as application_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
     yield
 
 
@@ -53,7 +51,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/health")
 def health():
     return {
-        "status": "success",
-        "code": status.HTTP_200_OK,
-        "data": {"message": "LLM Gateway is running"},
+        "msg": "LLM Gateway is running",
+        "status": status.HTTP_200_OK,
+        "data": {},
     }
