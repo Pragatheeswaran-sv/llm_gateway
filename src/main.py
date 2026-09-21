@@ -6,7 +6,6 @@ from fastapi.responses import JSONResponse
 
 from src.config import settings
 from src.conversation.api import router as conversation_router
-from src.database import init_db
 from src.register_application.api import router as application_router
 
 
