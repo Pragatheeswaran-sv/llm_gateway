@@ -55,4 +55,3 @@ class TokenRequest(BaseModel):
 
 class TokenData(BaseModel):
     access_token: str
-    time_expires: datetime
