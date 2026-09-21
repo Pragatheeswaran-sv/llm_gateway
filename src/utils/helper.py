@@ -55,12 +55,12 @@ def validate_dbml(dbml: str) -> bool:
 
 def parse_dbml_response(response: str) -> dict[str, str]:
     response = response.strip()
-    if "```" in response:
+    if "```" in response or "\\n" in response or "\\t" in response:
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
-        r"\s*DBML:\s*\n(?P<dbml>.*?)\n\s*SUMMARY:\s*\n"
-        r"(?P<summary>.*?)\n\s*EXPLANATION:\s*\n(?P<explanation>.+?)\s*",
+        r"\s*DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
+        r"(?P<summary>.*?)\s*EXPLANATION:\s*(?P<explanation>.*?)\s*",
         response,
         flags=re.DOTALL,
     )
@@ -71,7 +71,7 @@ def parse_dbml_response(response: str) -> dict[str, str]:
     summary = match.group("summary").strip()
     explanation = match.group("explanation").strip()
 
-    if not validate_dbml(dbml) or not summary or not explanation:
+    if not summary or not explanation:
         raise ValueError("Invalid DBML response from LLM.")
 
     return {

@@ -23,6 +23,16 @@ app.include_router(application_router)
 app.include_router(conversation_router)
 
 
+def _json_safe(value):
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -42,7 +52,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={
             "message": "Invalid request payload",
             "status_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "error": exc.errors(),
+            "error": _json_safe(exc.errors()),
         },
     )
 
