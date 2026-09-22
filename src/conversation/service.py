@@ -5,7 +5,8 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from src.register_application.models import RegisterApplication
-from src.utils.helper import decode_access_token, parse_dbml_response
+from src.utils.helper import decode_access_token, decrypt_api_key, parse_dbml_response
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -265,29 +266,37 @@ def call_llm(
     system_prompt: str,
     user_prompt: str,
 ):
-    if ai.lower() not in ("groq", "openai", "gemini"):
+    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi",):
         raise ValueError(f"Unsupported AI provider: {ai}")
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-    )
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
 
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        reasoning_effort= 'medium',
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ]
-    )
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            reasoning_effort='medium',
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.exception("LLM request failed for provider %s", ai)
+        raise RuntimeError("LLM request failed") from exc
+
+    if not response.choices or not response.choices[0].message.content:
+        raise RuntimeError("LLM returned an empty response")
+
     logger.info("response: %s", response.choices[0].message.content.strip())
     logger.info("Prompt tokens: %s", response.usage.prompt_tokens)
     logger.info("Completion tokens: %s", response.usage.completion_tokens)
@@ -353,24 +362,37 @@ def generate_dbml(
     user_query: str,
     ai: str,
     model: str,
-    api_key: str,
+    encrypted_api_key: str,
     base_url: str,
     enable_summary: bool = False,
     summary: str = "",
     dbml: str = "",
 ):
-    llm_response = generate_dbml_response(
-        enable_summary=enable_summary,
-        summary=summary,
-        user_query=user_query,
-        dbml=dbml,
-        ai=ai,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-    )
+    
+    try:
+        encrypt_key = settings.API_KEY_ENCRYPTION_KEY
+        api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
+    except Exception as exc:
+        logger.exception("Failed to decrypt the LLM API key")
+        raise ValueError("Invalid encrypted LLM API key") from exc
 
-    result = parse_dbml_response(llm_response)
+    try:
+        llm_response = generate_dbml_response(
+            enable_summary=enable_summary,
+            summary=summary,
+            user_query=user_query,
+            dbml=dbml,
+            ai=ai,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        result = parse_dbml_response(llm_response)
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to generate DBML response")
+        raise RuntimeError("Failed to generate DBML response") from exc
 
     if not enable_summary:
         result["updated_summary"] = None
