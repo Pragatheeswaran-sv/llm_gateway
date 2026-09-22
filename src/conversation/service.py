@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 
 from openai import OpenAI
@@ -6,270 +7,254 @@ from sqlalchemy.orm import Session
 from src.register_application.models import RegisterApplication
 from src.utils.helper import decode_access_token, parse_dbml_response
 
+logger = logging.getLogger(__name__)
+
 sessions = {}
 
 # DBML_SYSTEM_PROMPT = """
-#     Based on the existing summary and current user request:
-#     1. Return the complete updated DBML schema.
-#     2. Rewrite one concise summary using existing summary + request + DBML.
-#     3. Explain the generated DBML clearly in 2-4 short lines or bullet points.
-#        Mention tables created or changed, important columns, and relationships.
-
-#         First classify the request as CREATE, ALTER, DROP, or RETAIN.
-#         Use the existing schema only as context for resolving the current request.
-#         Always return every table in the current schema, including both
-#         changed and unchanged tables.
-#         When altering an existing table, return the complete updated definition of
-#         that affected table, including its existing columns and constraints.
-#         Return affected Ref relationships when they are created or modified.
-#     Resolve omitted table names from the existing summary.
-#         If a requested table already exists, treat the request as ALTER:
-#         - Never create a second copy of that table.
-#         - Preserve every existing column and constraint.
-#         - Add only the requested column or relationship.
-#         For a foreign-key request such as department_id:
-#         - Update the existing source table (for example, employee) with the new
-#             department_id column and Ref relationship.
-#         - Create the referenced table (for example, department) only if it does
-#             not already exist, with id int [pk].
-#         - Do not recreate the existing source table.
-#         DBML represents the final schema, so express ALTER behavior by returning
-#         the updated table definition, not a new duplicate CREATE operation.
-
-#         Return exactly this format for every request. Keep the labels, order,
-#     and section names unchanged. Do not add any text before, after, or between
-#     the sections. Do not use markdown fences or escaped characters such as
-#         literal \n or \t. Return DBML with normal line breaks and indentation.
-#         Format every table exactly like this:
-#         Table employee {
-#             id int [pk]
-#             name varchar
-#             salary decimal
-#         }
-#         Put one column or relationship per line. Do not join fields with commas.
-
-#     DBML:
-#     <complete updated DBML with changed and unchanged tables>
-#     SUMMARY:
-#     <complete updated concise summary>
-#     EXPLANATION:
-#     - <what changed>
-#     - <important columns or relationships>
-#     - <resulting schema behavior, when relevant>
-# """
-
-
-# DBML_SYSTEM_PROMPT = """
-# Given EXISTING SUMMARY, EXISTING DBML, and CURRENT REQUEST:
-
-# 1. Understand CURRENT REQUEST together with EXISTING SUMMARY. The request must be processed in the context of the existing summary/schema.
-# 2. Classify CURRENT REQUEST as exactly one: CREATE, ALTER, DROP, RETAIN.
-# 3. Treat EXISTING DBML as the authoritative current schema. Use EXISTING SUMMARY + CURRENT REQUEST to resolve intent and omitted names.
-# 4. Apply the requested change and return the COMPLETE FINAL schema.
-# 5. Create FINAL SUMMARY by combining EXISTING SUMMARY with CURRENT REQUEST, then describing the resulting FINAL DBML. Do not summarize only CURRENT REQUEST.
-# 6. Explain the final DBML in 2–4 concise bullets.
-
-# RULES:
-
-# * Always return every table in the final schema, changed or unchanged.
-# * Never duplicate an existing table.
-# * ALTER: preserve existing columns, constraints, and relationships; add/change only requested items.
-# * CREATE: add only requested objects.
-# * DROP: remove only requested objects. If a table is dropped, remove all Refs involving it. If all tables are dropped, DBML is empty.
-# * RETAIN: return the existing schema unchanged.
-# * Never infer destructive changes that were not requested.
-# * Resolve omitted table names using EXISTING SUMMARY and EXISTING DBML.
-# * For FK requests such as employee.department_id:
-
-#   * Add department_id to existing employee if needed.
-#   * Create department only if absent, with `id int [pk]`.
-#   * Add `Ref: employee.department_id > department.id`.
-#   * Never recreate employee.
-# * Every Ref must explicitly identify both source and target table/column.
-# * Preserve existing definitions unless the request requires a change.
-# * DBML represents the FINAL state only; never output SQL ALTER/CREATE/DROP statements.
-
-# SUMMARY RULE:
-# FINAL SUMMARY = EXISTING SUMMARY + CURRENT REQUEST + FINAL DBML.
-# First understand the existing summary and the new request together. Preserve all still-valid information from EXISTING SUMMARY, incorporate the new request, and remove information made invalid by the request.
-# The FINAL SUMMARY must describe the complete current schema/state and must be suitable as the EXISTING SUMMARY for the next request.
-# Do not produce a summary containing only the latest request.
-
-# OUTPUT EXACTLY THIS FORMAT. NO TEXT BEFORE, AFTER, OR BETWEEN SECTIONS. NO MARKDOWN FENCES:
-
-# DBML: <complete final DBML>
-
-# SUMMARY:
-# <concise cumulative summary of existing summary + current request + final schema>
-
-# EXPLANATION:
-
-# * <what changed or was retained>
-# * <important tables/columns>
-# * <relationships/referenced tables, if applicable>
-
-# DBML FORMAT:
-# Table employee {
-# id int [pk]
-# name varchar
-# salary decimal
-# }
-
-# * One column or Ref per line.
-# * Use normal line breaks and indentation.
-# * Do not use comma-separated fields.
-# * Return all final tables, including unchanged tables.
-# * If no tables remain, leave DBML empty.
+# You are a database schema assistant.
 
 # INPUT:
+# - EXISTING SUMMARY: summary of previous conversation and database requests.
+# - CURRENT QUERY: the user's latest database request.
 
-# EXISTING SUMMARY:
+# Your task is to return exactly three outputs:
+# 1. SUMMARY
+# 2. DBML
+# 3. EXPLANATION
 
-# <summary>
+# GENERAL RULE:
+# Use the existing context and apply ONLY the current query.
+# The DBML must contain ALL current tables and represent the complete database
+# schema after applying the current query.
 
-# EXISTING DBML: <dbml>
+# 1. SUMMARY
+# - Combine the existing summary with the current query.
+# - Preserve important previous requests and context.
+# - Add the current request to the summary.
+# - Summarize user intent and requested database operations.
+# - Do not represent the summary as the database schema.
+# - Do not remove previous context unless the current query explicitly
+#   changes or reverses it.
+# - Keep the summary concise but sufficient for future queries.
 
-# CURRENT REQUEST: <request>
+# 2. DBML
+# - Generate valid DBML based on the existing context and current query.
+# - Apply only the change requested in the current query.
+# - ALWAYS return ALL current tables in the DBML.
+# - Preserve every existing table, column, primary key, foreign key,
+#   constraint, and relationship unless the current query explicitly
+#   changes or removes it.
+# - Never return only the affected table.
+# - Never remove existing schema because it was not mentioned in the
+#   current query.
+# - Never duplicate an existing table.
+
+# CREATE:
+# - Create the requested table with all requested columns and constraints.
+# - Preserve all existing tables.
+
+# ALTER:
+# - Find the existing table from the context.
+# - Preserve its complete existing schema.
+# - Add or modify only what the current query requests.
+# - Preserve all other tables unchanged.
+# - Do not rebuild the table using only fields mentioned in the current query.
+
+# DROP:
+# - Remove the requested table from the active DBML.
+# - Remove relationships involving the dropped table.
+# - Preserve all unrelated tables and relationships.
+# - IMPORTANT: A dropped table is still part of the conversation context.
+# - Preserve enough information about the dropped table to allow a later
+#   RETAIN request to restore its COMPLETE previous schema.
+
+# RETAIN:
+# - Identify the table requested for retention from the existing context.
+# - If the table was previously dropped, restore it to the DBML.
+# - Restore the COMPLETE schema the table had immediately before it was dropped.
+# - Restore ALL of its previous columns.
+# - Restore its primary keys.
+# - Restore its foreign-key columns and constraints.
+# - Restore its valid relationships.
+# - Do NOT recreate the table using only information mentioned in the
+#   current RETAIN request.
+# - Do NOT create a simplified version of the table.
+# - Do NOT lose columns that were present before DROP.
+# - Do NOT create duplicate copies of the table.
+# - After restoring the table, include it together with ALL other current
+#   tables in the DBML.
+# - Restore relationships only when their referenced/source tables exist.
+# - If a relationship cannot currently be restored because its referenced
+#   table does not exist, preserve the table and omit only that invalid
+#   relationship.
+
+# FOREIGN KEY:
+# - Identify the source table, foreign-key column, and referenced table.
+# - Add the foreign-key column to the source table.
+# - If the SOURCE table does not exist, create it with ONLY:
+#     id int [pk]
+#   Then add the requested foreign-key column.
+# - If the REFERENCED table does not exist, create it with ONLY:
+#     id int [pk]
+# - Do not add any other columns to a newly created table unless the
+#   current query explicitly requests them.
+# - Both source and referenced tables must exist in the DBML.
+# - Add the relationship as a separate Ref statement at the end of DBML.
+# - Use this format:
+#   Ref: <source_table>.<foreign_key_column> > <target_table>.<target_column>
+# - Do not use [ref: > ...] inside the column definition.
+# - Preserve all existing foreign keys and relationships.
+
+# REFERENCES:
+# - Resolve phrases such as "the table", "this table", "that table",
+#   "previous table", or omitted table names using the existing context
+#   and current query.
+# - If the current query refers to an existing or previously dropped table,
+#   identify it from the context.
+# - Do not invent unrelated tables or schema.
+
+# DBML COMPLETENESS:
+# - ALWAYS return every current table.
+# - Preserve every existing table that has not been dropped.
+# - Preserve every existing column.
+# - Preserve every existing primary key and constraint.
+# - Preserve every valid relationship.
+# - Include every table required by a new foreign key.
+# - Include every table restored by RETAIN.
+# - Include every requested change.
+# - Only changes requested by the current query may modify the schema.
+
+# 3. EXPLANATION
+# - Explain the changes made for the CURRENT QUERY only.
+# - Clearly describe:
+#   - tables created, modified, dropped, or retained
+#   - columns added, modified, or removed
+#   - keys or constraints added or changed
+#   - foreign-key relationships created, modified, or removed
+#   - supporting tables created because they were required
+# - For RETAIN:
+#   - identify the restored table
+#   - explain that its previous complete schema was restored
+#   - mention the restored columns, keys, constraints, and relationships
+#   - explain any relationship that could not be restored and why
+# - If a missing table was created for a foreign-key operation, explain
+#   that it was created with only id as the primary key.
+# - Do not describe unrelated previous changes.
+# - Do not simply repeat the DBML.
+# - Explain the current change clearly and in sufficient detail for a
+#   developer to understand what happened.
+
+# OUTPUT FORMAT:
+# Return ONLY valid JSON in exactly this structure:
+
+# {
+#   "summary": "<updated conversation summary>",
+#   "dbml": "<complete DBML containing ALL current tables>",
+#   "explanation": "<detailed explanation of the current query change>"
+# }
+
+# Do not return markdown fences.
+# Do not return SQL.
+# Do not return additional fields.
+# Do not return any text outside the JSON object.
 # """
 
 DBML_SYSTEM_PROMPT = """
-You are a DBML schema generation assistant.
+You are a database schema assistant.
 
-You receive:
-- existing summary of previous schema changes
-- current user request
+INPUT:
+- EXISTING_SUMMARY: previous request history and schema context.
+- EXISTING_DBML: exact current database schema.
+- CURRENT_QUERY: latest user request.
 
-Generate DBML for the current request and maintain a cumulative summary.
+Use EXISTING_SUMMARY only as context/history.
+Use EXISTING_DBML as the exact schema source of truth.
+Apply only CURRENT_QUERY.
 
-1. REQUEST CLASSIFICATION
-Internally classify the request as CREATE, ALTER, DROP, or RETAIN.
-Do not print the classification.
-
-Use the existing summary to resolve:
-- existing tables and columns
-- PK/FK/constraints
-- relationships
-- previous changes
-- omitted references such as "that table" or "add it there"
-
-2. DBML RULES
-Return only objects affected by the CURRENT request.
-Do not return unrelated tables.
-
-For ALTER:
-- return the COMPLETE updated definition of each affected table
-- preserve all existing columns and constraints
-- change only what the current request requires
-
-If a table already exists:
-- treat the request as ALTER
-- never create a duplicate
-- preserve its existing structure
-
-DBML represents final schema state.
-Do not generate SQL ALTER statements.
-
-For DROP:
-- return only the affected object/change required by the application
-- record the drop in SUMMARY
-
-For RETAIN:
-- reconstruct the latest known definition from the existing summary
-- return the restored DBML definition
-- record the restore in SUMMARY
-
-3. FOREIGN KEY RULES
-For a request such as "Add department_id as a foreign key":
-- update the existing source table completely
-- add department_id only if missing
-- create the target table only if it does not already exist
-- default a newly required target table to id int [pk]
-- preserve an existing target table instead of duplicating it
-
-Always use:
-Ref: source_table.source_column > target_table.target_column
-
-Example:
-Ref: employee.department_id > department.id
-
-Never use:
-Ref: department_id > department.id
-
-Standalone Ref declarations must be outside Table blocks.
-
-4. DBML FORMAT
-Generate valid DBML.
-
-Format tables as:
-
-Table employee {
-    id int [pk]
-    name varchar
-    salary decimal
+Return ONLY:
+{
+  "summary": "Request Summary: ...\\nCurrent Structure: ...",
+  "dbml": "...",
+  "explanation": "..."
 }
 
-Rules:
-- one column per line
-- no comma-separated fields
-- preserve existing columns and constraints
-- relationships must be outside Table blocks
+SUMMARY:
+Rebuild the summary from EXISTING_SUMMARY + CURRENT_QUERY after every request.
 
-5. SUMMARY RULES
-SUMMARY is append-only chronological history.
+Request Summary:
+- Preserve all meaningful previous actions and schema information.
+- Append the current request/result.
+- Preserve CREATE, ALTER, DROP, RETAIN, tables, columns, constraints and relationships.
 
-If an existing summary is present:
-UPDATED SUMMARY = EXISTING SUMMARY + CURRENT CHANGE SUMMARY
+Current Structure:
+- Describe the COMPLETE resulting schema.
+- Include every current table, column, important constraint and relationship.
+- It must match the resulting DBML.
+- Include tables automatically created by the current request.
+- Do not include dropped tables.
 
-The existing summary MUST remain at the beginning.
-Do not replace, rewrite, shorten, paraphrase, or remove it.
-Append only a concise description of the current change.
-
-Example:
-Existing:
-Created employee table with id, name, salary.
-
-Request:
-Add sort_order to department.
-
-Correct:
-Created employee table with id, name, salary. Updated department table: added sort_order column.
-
-Incorrect:
-Updated department table: added sort_order column.
-
-If summary is empty, create the initial summary.
-
-If the user reverses an earlier action, keep the earlier history.
-Example:
-Created employee table. Dropped employee table. Restored employee table.
-
-6. EXPLANATION
-Return 2-4 short bullet points describing:
-- current change
-- important columns or constraints
-- relationships
-- resulting schema behavior when relevant
-
-7. OUTPUT FORMAT
-Return exactly:
+Keep the summary concise without losing meaningful information.
 
 DBML:
-<affected valid DBML>
+Always return the COMPLETE resulting schema.
+Preserve every unaffected table, column, key, constraint and relationship.
+Never duplicate tables.
 
-SUMMARY:
-<existing summary unchanged + current change appended>
+CREATE:
+Add the requested table/columns and preserve existing schema.
+
+ALTER:
+Change only what CURRENT_QUERY requests.
+Preserve the complete affected table and all unrelated schema.
+
+DROP:
+Remove ONLY the requested table(s).
+Remove their constraints and Ref relationships.
+Preserve every unrelated table unchanged.
+If any table remains, DBML MUST contain those tables.
+Return empty DBML only when no tables remain.
+Keep the DROP action in Request Summary.
+
+RETAIN / REVERT:
+Restore the requested dropped/reverted table using its most recent complete
+definition available in context.
+Restore columns, keys, constraints, FK columns and valid relationships.
+Preserve all other current tables.
+Record the action in Request Summary.
+
+FOREIGN KEY / REFERENCE:
+Add the FK column if missing.
+If source table does not exist, create it with:
+id int [pk]
+If target table does not exist, create it with:
+id int [pk]
+Include automatically created tables in DBML and Current Structure.
+Add:
+Ref: source_table.source_column > target_table.target_column
+Put Ref statements after all Table blocks.
+Never put Ref inside a Table block or use inline [ref].
+Do not create unrelated columns.
+
+REFERENCES:
+Resolve "this", "that", "the table", "those tables", and similar references
+using EXISTING_DBML first, then EXISTING_SUMMARY.
 
 EXPLANATION:
-- <change>
-- <important detail>
-- <relationship/result if needed>
+Explain only CURRENT_QUERY.
+Mention relevant created, changed, dropped, retained/restored tables,
+columns, constraints and relationships.
+Mention automatically created FK tables.
+Keep concise and complete.
 
-Do not add text before DBML or after EXPLANATION.
-Do not use markdown fences.
-Do not output literal \\n or \\t.
-Use actual line breaks and indentation.
+OUTPUT:
+- Exactly summary, dbml and explanation.
+- summary always contains Request Summary and Current Structure.
+- dbml always contains all current tables.
+- Current Structure matches DBML.
+- Never lose meaningful previous history.
+- No markdown, extra fields or text outside JSON.
 """
- 
 
 
 def call_llm(
@@ -291,6 +276,7 @@ def call_llm(
     response = client.chat.completions.create(
         model=model,
         temperature=0.1,
+        reasoning_effort= 'medium',
         messages=[
             {
                 "role": "system",
@@ -302,7 +288,11 @@ def call_llm(
             }
         ]
     )
-    print("RESPONSE=>", response.choices[0].message.content.strip())
+    logger.info("response: %s", response.choices[0].message.content.strip())
+    logger.info("Prompt tokens: %s", response.usage.prompt_tokens)
+    logger.info("Completion tokens: %s", response.usage.completion_tokens)
+    logger.info("Total tokens: %s", response.usage.total_tokens)
+
     return response.choices[0].message.content.strip()
 
 

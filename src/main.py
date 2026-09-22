@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -7,6 +8,11 @@ from fastapi.responses import JSONResponse
 from src.config import settings
 from src.conversation.api import router as conversation_router
 from src.register_application.api import router as application_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager
