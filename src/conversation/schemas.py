@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class DBMLGenerateRequest(BaseModel):
@@ -10,6 +10,12 @@ class DBMLGenerateRequest(BaseModel):
     enable_summary: bool = False
     summary: str | None = None
     dbml: str = ""
+
+    # @model_validator(mode="after")
+    # def require_summary_when_enabled(self):
+    #     if self.enable_summary and not self.summary:
+    #         raise ValueError("summary is required when enable_summary is true")
+    #     return self
 
 
 class DBMLGenerateData(BaseModel):

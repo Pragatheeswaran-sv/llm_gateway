@@ -34,7 +34,7 @@ def clean_dbml(dbml: str) -> str:
         if line == "}":
             table_name = table_lines[0].rstrip("{").strip()
             columns = table_lines[1:-1]
-            flattened.append(f"{table_name} {{{', '.join(columns)}}}")
+            flattened.append(f"{table_name} {{{' '.join(columns)}}}")
             table_lines = []
 
     if table_lines:
@@ -53,25 +53,57 @@ def validate_dbml(dbml: str) -> bool:
     return "Table " in normalized and "{" in normalized and "}" in normalized
 
 
+def normalize_llm_text(value: str) -> str:
+    """Convert escape sequences that survived JSON decoding into characters."""
+    return (
+        value.replace("\\", " ")
+        .replace("\n", " ")
+        .replace("\t", " ")
+    )
+
+
 def parse_dbml_response(response: str) -> dict[str, str]:
     response = response.strip()
-    if "```" in response:
+
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        dbml = payload.get("dbml")
+        summary = payload.get("summary")
+        explanation = payload.get("explanation")
+
+        if not all(isinstance(value, str) for value in (dbml, summary, explanation)):
+            raise ValueError("Invalid DBML response format from LLM.")
+
+        if not summary.strip() or not explanation.strip():
+            raise ValueError("Invalid DBML response from LLM.")
+
+        return {
+            "dbml_query": normalize_llm_text(dbml).strip(),
+            "updated_summary": normalize_llm_text(summary).strip(),
+            "explanation": normalize_llm_text(explanation).strip(),
+        }
+
+    if "```" in response or "\\n" in response or "\\t" in response:
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
-        r"\s*DBML:\s*\n(?P<dbml>.*?)\n\s*SUMMARY:\s*\n"
-        r"(?P<summary>.*?)\n\s*EXPLANATION:\s*\n(?P<explanation>.+?)\s*",
+        r"\s*DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
+        r"(?P<summary>.*?)\s*EXPLANATION:\s*(?P<explanation>.*?)\s*",
         response,
         flags=re.DOTALL,
     )
     if not match:
         raise ValueError("Invalid DBML response format from LLM.")
 
-    dbml = clean_dbml(match.group("dbml"))
+    dbml = match.group("dbml").strip()
     summary = match.group("summary").strip()
     explanation = match.group("explanation").strip()
 
-    if not validate_dbml(dbml) or not summary or not explanation:
+    if not summary or not explanation:
         raise ValueError("Invalid DBML response from LLM.")
 
     return {
