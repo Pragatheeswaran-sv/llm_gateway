@@ -6,6 +6,9 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+import os
+import base64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from src.config import settings
 
@@ -82,9 +85,9 @@ def parse_dbml_response(response: str) -> dict[str, str]:
             raise ValueError("Invalid DBML response from LLM.")
 
         return {
-            "dbml_query": normalize_llm_text(dbml).strip(),
+            "dbml_query": (dbml).strip(),
             "updated_summary": normalize_llm_text(summary).strip(),
-            "explanation": normalize_llm_text(explanation).strip(),
+            "explanation": (explanation).strip(),
         }
 
     if "```" in response or "\\n" in response or "\\t" in response:
@@ -201,3 +204,20 @@ def decode_access_token(token: str) -> dict:
         raise AccessTokenError("Invalid access token")
 
     return payload
+
+def decrypt_api_key(encrypted_api_key: str, encryption_key: str) -> str:
+    key = base64.b64decode(encryption_key)
+    encrypted_data = base64.b64decode(encrypted_api_key)
+
+    nonce = encrypted_data[:12]
+    ciphertext_and_tag = encrypted_data[12:]
+
+    aesgcm = AESGCM(key)
+
+    decrypted = aesgcm.decrypt(
+        nonce,
+        ciphertext_and_tag,
+        None
+    )
+
+    return decrypted.decode("utf-8")
