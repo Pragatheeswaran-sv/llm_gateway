@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,105 @@ from src.config import settings
 
 class AccessTokenError(ValueError):
     pass
+
+
+def clean_dbml(dbml: str) -> str:
+    dbml = dbml.strip()
+
+    if dbml.startswith("```"):
+        lines = [
+            line
+            for line in dbml.splitlines()
+            if not line.strip().startswith("```")
+        ]
+        dbml = "\n".join(lines).strip()
+
+    lines = [line.strip() for line in dbml.splitlines() if line.strip()]
+    flattened = []
+    table_lines = []
+
+    for line in lines:
+        table_lines.append(line)
+        if line == "}":
+            table_name = table_lines[0].rstrip("{").strip()
+            columns = table_lines[1:-1]
+            flattened.append(f"{table_name} {{{' '.join(columns)}}}")
+            table_lines = []
+
+    if table_lines:
+        flattened.extend(table_lines)
+
+    dbml = " ".join(flattened).strip()
+
+    return dbml
+
+
+def validate_dbml(dbml: str) -> bool:
+    if not dbml:
+        return False
+
+    normalized = clean_dbml(dbml)
+    return "Table " in normalized and "{" in normalized and "}" in normalized
+
+
+def normalize_llm_text(value: str) -> str:
+    """Convert escape sequences that survived JSON decoding into characters."""
+    return (
+        value.replace("\\", " ")
+        .replace("\n", " ")
+        .replace("\t", " ")
+    )
+
+
+def parse_dbml_response(response: str) -> dict[str, str]:
+    response = response.strip()
+
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        dbml = payload.get("dbml")
+        summary = payload.get("summary")
+        explanation = payload.get("explanation")
+
+        if not all(isinstance(value, str) for value in (dbml, summary, explanation)):
+            raise ValueError("Invalid DBML response format from LLM.")
+
+        if not summary.strip() or not explanation.strip():
+            raise ValueError("Invalid DBML response from LLM.")
+
+        return {
+            "dbml_query": normalize_llm_text(dbml).strip(),
+            "updated_summary": normalize_llm_text(summary).strip(),
+            "explanation": normalize_llm_text(explanation).strip(),
+        }
+
+    if "```" in response or "\\n" in response or "\\t" in response:
+        raise ValueError("Invalid DBML response format from LLM.")
+
+    match = re.fullmatch(
+        r"\s*DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
+        r"(?P<summary>.*?)\s*EXPLANATION:\s*(?P<explanation>.*?)\s*",
+        response,
+        flags=re.DOTALL,
+    )
+    if not match:
+        raise ValueError("Invalid DBML response format from LLM.")
+
+    dbml = match.group("dbml").strip()
+    summary = match.group("summary").strip()
+    explanation = match.group("explanation").strip()
+
+    if not summary or not explanation:
+        raise ValueError("Invalid DBML response from LLM.")
+
+    return {
+        "dbml_query": dbml,
+        "updated_summary": summary,
+        "explanation": explanation,
+    }
 
 
 def generate_client_id() -> str:
