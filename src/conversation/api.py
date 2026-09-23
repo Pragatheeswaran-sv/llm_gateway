@@ -39,7 +39,7 @@ def generate_dbml_endpoint(
             user_query=request.user_query,
             ai=request.model,
             model=request.llm,
-            api_key=request.llm_api_key,
+            encrypted_api_key=request.llm_api_key,
             base_url=request.base_url,
             enable_summary=request.enable_summary,
             summary=request.summary if request.enable_summary else "",
