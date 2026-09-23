@@ -1,27 +1,80 @@
-from pydantic import BaseModel, model_validator
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+SUPPORTED_PROVIDERS = {"groq", "openai", "gemini", "claude", "kimi"}
 
 
 class DBMLGenerateRequest(BaseModel):
-    user_query: str
-    model: str
-    llm: str
-    llm_api_key: str
-    base_url: str
+    """Generate DBML using either direct credentials or database fallback."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_query: str = Field(min_length=1)
+    dbml: str = ""
     enable_summary: bool = False
     summary: str | None = None
-    dbml: str = ""
+    model: str | None = None
+    llm: str | None = None
+    llm_api_key: str | None = None
+    base_url: str | None = None
 
-    # @model_validator(mode="after")
-    # def require_summary_when_enabled(self):
-    #     if self.enable_summary and not self.summary:
-    #         raise ValueError("summary is required when enable_summary is true")
-    #     return self
+    @model_validator(mode="after")
+    def validate_direct_provider_fields(self):
+        fields = {
+            "model": self.model,
+            "llm": self.llm,
+            "llm_api_key": self.llm_api_key,
+            "base_url": self.base_url,
+        }
+        supplied = {name: value for name, value in fields.items() if value and value.strip()}
+        if supplied and len(supplied) != len(fields):
+            missing = ", ".join(name for name, value in fields.items() if not value or not value.strip())
+            raise ValueError(
+                "model, llm, llm_api_key, and base_url must all be provided "
+                f"when using direct provider mode; missing: {missing}"
+            )
+
+        for name, value in fields.items():
+            if value is not None:
+                stripped = value.strip()
+                setattr(self, name, stripped or None)
+
+        if self.model and self.model.lower() not in SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
+            raise ValueError(
+                f"Unsupported provider '{self.model}'. Supported providers: {supported}."
+            )
+
+        if self.base_url:
+            try:
+                url = urlsplit(self.base_url)
+                valid = (
+                    url.scheme in {"http", "https"}
+                    and bool(url.hostname)
+                    and url.username is None
+                    and url.password is None
+                    and not url.query
+                    and not url.fragment
+                    and not any(char.isspace() for char in self.base_url)
+                )
+                url.port  # Validate the port, if supplied.
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError(
+                    "base_url must be a plain HTTP or HTTPS URL without credentials, "
+                    "query parameters, or fragments; do not use Markdown link formatting"
+                )
+
+        return self
 
 
 class DBMLGenerateData(BaseModel):
     dbml_query: str
     updated_summary: str | None
     explanation: str
+    token_used: int = 0
 
 
 class DBMLGenerateResponse(BaseModel):

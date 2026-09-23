@@ -1,12 +1,17 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
+from src.conversation.fallback import (
+    InvalidDirectAPIKeyError,
+    NoAvailableLLMError,
+    ProviderRequestError,
+)
 from src.conversation.schemas import (
     DBMLGenerateData,
     DBMLGenerateRequest,
     DBMLGenerateResponse,
 )
-from src.conversation.service import validate_access_token, generate_dbml
+from src.conversation.service import generate_dbml, validate_access_token
 from src.database import get_db
 
 
@@ -27,7 +32,7 @@ def generate_dbml_endpoint(
 
     token = authorization.split(" ", 1)[1].strip()
     try:
-        app = validate_access_token(db, token)
+        validate_access_token(db, token)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -36,14 +41,15 @@ def generate_dbml_endpoint(
 
     try:
         result = generate_dbml(
-            user_query=request.user_query,
-            ai=request.model,
-            model=request.llm,
-            encrypted_api_key=request.llm_api_key,
-            base_url=request.base_url,
-            enable_summary=request.enable_summary,
-            summary=request.summary if request.enable_summary else "",
+            db=db,
             dbml=request.dbml,
+            user_query=request.user_query,
+            enable_summary=request.enable_summary,
+            summary=request.summary if request.enable_summary and request.summary else "",
+            direct_model=request.model,
+            llm=request.llm,
+            llm_api_key=request.llm_api_key,
+            base_url=request.base_url,
         )
 
         return DBMLGenerateResponse(
@@ -52,8 +58,19 @@ def generate_dbml_endpoint(
             data=DBMLGenerateData(**result),
         )
 
+    except NoAvailableLLMError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"{exc.message} {exc}",
+        ) from exc
+    except InvalidDirectAPIKeyError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

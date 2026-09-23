@@ -1,3 +1,16 @@
+from src.conversation.fallback import (
+    NoAvailableLLMError,
+    call_model,
+    call_direct_model,
+    estimate_tokens,
+    get_candidate_models,
+    is_auth_or_model_error,
+    is_rate_limit_error,
+    is_retryable_provider_error,
+    record_rate_limit,
+    record_success,
+    record_unavailable,
+)
 import logging
 from uuid import UUID
 
@@ -358,43 +371,118 @@ def validate_access_token(db: Session, token: str) -> RegisterApplication:
     return app
 
 
+
+def build_user_prompt(enable_summary: bool, summary: str, user_query: str, dbml: str = "") -> str:
+    existing_summary = (summary or "").strip() if enable_summary else ""
+    if not existing_summary:
+        existing_summary = "NO PREVIOUS SUMMARY"
+
+    return (
+        f"EXISTING_SUMMARY:\n{existing_summary}\n\n"
+        f"EXISTING_DBML:\n{dbml or 'No existing DBML.'}\n\n"
+        f"CURRENT_QUERY:\n{user_query.strip()}\n\n"
+        f"SUMMARY_ENABLED:\n{enable_summary}"
+    )
+
+
 def generate_dbml(
+    db: Session,
     user_query: str,
-    ai: str,
-    model: str,
-    encrypted_api_key: str,
-    base_url: str,
     enable_summary: bool = False,
     summary: str = "",
+    direct_model: str | None = None,
+    llm: str | None = None,
+    llm_api_key: str | None = None,
+    base_url: str | None = None,
     dbml: str = "",
-):
-    
-    try:
-        encrypt_key = settings.API_KEY_ENCRYPTION_KEY
-        api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
-    except Exception as exc:
-        logger.exception("Failed to decrypt the LLM API key")
-        raise ValueError("Invalid encrypted LLM API key") from exc
+) -> dict:
+    user_prompt = build_user_prompt(
+        enable_summary=enable_summary,
+        summary=summary,
+        user_query=user_query,
+        dbml=dbml,
+    )
 
-    try:
-        llm_response = generate_dbml_response(
-            enable_summary=enable_summary,
-            summary=summary,
-            user_query=user_query,
-            dbml=dbml,
-            ai=ai,
-            model=model,
-            api_key=api_key,
+    estimated_tokens = estimate_tokens(DBML_SYSTEM_PROMPT + "\n" + user_prompt)
+
+    if direct_model and llm and llm_api_key and base_url:
+        call = call_direct_model(
+            model_name=llm,
+            api_key=llm_api_key,
             base_url=base_url,
+            system_prompt=DBML_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
         )
-        result = parse_dbml_response(llm_response)
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.exception("Failed to generate DBML response")
-        raise RuntimeError("Failed to generate DBML response") from exc
+        result = parse_dbml_response(call.content)
+        if not enable_summary:
+            result["updated_summary"] = None
+        result["token_used"] = call.total_tokens
+        return result
 
-    if not enable_summary:
-        result["updated_summary"] = None
+    candidates = get_candidate_models(db, estimated_tokens=estimated_tokens)
 
-    return result
+    if not candidates:
+        raise NoAvailableLLMError(
+            "No LLM fallback model currently has enough RPM/TPM/RPD/TPD capacity."
+        )
+
+    failures: list[str] = []
+
+    for position, model in enumerate(candidates, start=1):
+        logger.info(
+            "Trying LLM fallback position=%s model=%s estimated_tokens=%s",
+            position,
+            model.llm_model,
+            estimated_tokens,
+        )
+
+        try:
+            call = call_model(
+                model=model,
+                system_prompt=DBML_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+
+            # Provider usage counts even when parsing/validation fails.
+            record_success(db, model, call.total_tokens)
+
+            result = parse_dbml_response(call.content)
+            if not enable_summary:
+                result["updated_summary"] = None
+            result["token_used"] = call.total_tokens
+
+            logger.info(
+                "LLM selected model=%s fallback_used=%s total_tokens=%s",
+                model.llm_model,
+                position > 1,
+                call.total_tokens,
+            )
+            return result
+
+        except ValueError as exc:
+            # Invalid generated format: try the next generation model.
+            failures.append(f"{model.llm_model}: invalid response: {exc}")
+            logger.warning("Invalid LLM response model=%s error=%s", model.llm_model, exc)
+            continue
+
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                record_rate_limit(db, model, exc)
+                failures.append(f"{model.llm_model}: rate limited")
+                continue
+
+            if is_auth_or_model_error(exc):
+                record_unavailable(db, model, str(exc))
+                failures.append(f"{model.llm_model}: unavailable")
+                continue
+
+            if is_retryable_provider_error(exc):
+                failures.append(f"{model.llm_model}: transient provider error: {exc}")
+                logger.warning("Transient LLM error model=%s error=%s", model.llm_model, exc)
+                continue
+
+            raise
+
+    raise NoAvailableLLMError(
+        "All available LLM fallback models failed. " + "; ".join(failures)
+    )
