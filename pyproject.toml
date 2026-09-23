@@ -30,6 +30,9 @@ httpx = "^0.28.0"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: tests that make external service calls",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]

@@ -1,111 +1,38 @@
-# LLM Gateway - Registration and Access Token Milestone
+# Implementation Summary
 
-## Database
+## Registration/token
 
-Create the PostgreSQL database first:
+- `POST /app/register` creates an application and returns client credentials.
+- `POST /app/token` validates client credentials and returns a short-lived access token.
+- `/api/v1/generate` requires `Authorization: Bearer <access_token>`.
 
-```sql
-CREATE DATABASE llmservice;
-```
+## Generate payload
 
-Default connection:
-
-```text
-postgresql+psycopg://postgres:postgres@localhost:5432/llmservice
-```
-
-The service creates one table named `register` with:
-
-- `id`
-- `app_name`
-- `description` (optional)
-- `client_id`
-- `client_secret_key` (deterministic HMAC-SHA256 digest, never plaintext)
-- `is_active`
-- `created_at`
-
-Both endpoints use this same model.
-
-## Secret hashing
-
-The raw `client_secret_key` is returned only at registration time. Before database storage it is converted to deterministic HMAC-SHA256 using `CLIENT_SECRET_HASH_PEPPER`.
-
-The same plaintext secret + the same pepper always produces the same stored digest. Keep the pepper stable and private.
-
-## Endpoint 1 - Register application
-
-`POST /app/register`
-
-Request:
+The public payload is intentionally small:
 
 ```json
 {
-  "name": "MY_APP",
-  "description": "Optional description"
+  "user_query": "Create an employee table with id, name and salary.",
+  "enable_summary": true,
+  "summary": "optional only after the first request"
 }
 ```
 
-Response:
+The gateway, not the consumer, owns model/API-key/base-URL selection.
 
-```json
-{
-  "status": "success",
-  "code": 201,
-  "data": {
-    "client_id": "client_...",
-    "client_secret_key": "raw-secret-returned-once",
-    "app_name": "MY_APP"
-  }
-}
-```
+## Summary memory
 
-## Endpoint 2 - Access token
+The first request has no summary. Every successful response returns `updated_summary`; the consumer sends that value on the next turn. The summary contains a compact request history and the complete current schema state, including enough last-known dropped definitions for RETAIN/REVERT.
 
-`POST /app/token`
+## Fallback model routing
 
-Request:
+`llm_fallback_models` stores exactly the requested model and quota fields. Generation fallback order is server-owned and currently prefers GPT-OSS 120B → Qwen 3.8 27B → GPT-OSS 20B → Allam 2 7B. Prompt Guard/Safeguard rows are not generation fallbacks.
 
-```json
-{
-  "client_id": "client_...",
-  "client_secret_key": "raw-secret-returned-once"
-}
-```
+Pre-call checks use local RPM/TPM/RPD/TPD counters. Real HTTP 429 responses set `is_rate_limited` and `cooldown_until`. Authentication/model errors can mark a model unavailable. Successful calls update counters and expose provider `total_tokens` as `used_tokens` in the response.
 
-The endpoint:
+## Tests
 
-1. Finds the application using `client_id`.
-2. Ensures the application is active.
-3. Deterministically hashes the submitted secret.
-4. Compares it to the stored hash using constant-time comparison.
-5. Issues one JWT access token valid for 60 minutes.
-6. Does not issue a refresh token.
-
-Response:
-
-```json
-{
-  "status": "success",
-  "code": 200,
-  "data": {
-    "access_token": "eyJ...",
-    "time_expires": "2026-09-19T12:30:00+00:00"
-  }
-}
-```
-
-## Run locally
-
-```bash
-poetry install
-cp .env.example .env
-poetry run uvicorn src.main:app --reload
-```
-
-Swagger:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-No refresh-token endpoint is implemented in this milestone.
+- `test_fallback_router.py`: deterministic fallback and payload tests.
+- `test_response_parsing.py`: single-line summary/explanation and multiline DBML parsing.
+- `test_nlp_scenarios.py`: optional live 12-scenario / 74-query endpoint suite.
+- `EXPECTED_SCENARIOS.md`: expected schema and fallback behavior.

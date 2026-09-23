@@ -32,8 +32,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     return {
-        "msg": "application registered successfully",
-        "status": status.HTTP_201_CREATED,
+        "message": "Application registered successfully",
+        "status_code": status.HTTP_201_CREATED,
         "data": {
             "client_id": application.client_id,
             "client_secret_key": raw_secret,
@@ -54,8 +54,8 @@ def token(payload: TokenRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
     return {
-        "msg": "Token issued successfully",
-        "status": status.HTTP_200_OK,
+        "message": "Token issued successfully",
+        "status_code": status.HTTP_200_OK,
         "data": {
             "access_token": access_token,
             "time_expires": expires_at,

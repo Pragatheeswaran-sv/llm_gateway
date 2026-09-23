@@ -1,214 +1,128 @@
 import logging
 from uuid import UUID
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from src.conversation.fallback import (
+    NoAvailableLLMError,
+    call_model,
+    call_direct_model,
+    estimate_tokens,
+    get_candidate_models,
+    is_auth_or_model_error,
+    is_rate_limit_error,
+    is_retryable_provider_error,
+    record_rate_limit,
+    record_success,
+    record_unavailable,
+)
 from src.register_application.models import RegisterApplication
-from src.utils.helper import decode_access_token, decrypt_api_key, parse_dbml_response
-from src.config import settings
+from src.utils.helper import decode_access_token, parse_dbml_response
 
 logger = logging.getLogger(__name__)
 
-sessions = {}
-
 # DBML_SYSTEM_PROMPT = """
-# You are a database schema assistant.
+# You are a DBML schema generation assistant.
 
 # INPUT:
-# - EXISTING SUMMARY: summary of previous conversation and database requests.
-# - CURRENT QUERY: the user's latest database request.
+# - EXISTING_SUMMARY: the only memory of earlier schema requests.
+# - CURRENT_QUERY: the latest request.
+# - SUMMARY_ENABLED: whether an updated summary is required.
 
-# Your task is to return exactly three outputs:
-# 1. SUMMARY
-# 2. DBML
-# 3. EXPLANATION
+# Use EXISTING_SUMMARY to reconstruct the exact prior schema state. Apply only
+# CURRENT_QUERY and return the COMPLETE active schema after the change.
 
-# GENERAL RULE:
-# Use the existing context and apply ONLY the current query.
-# The DBML must contain ALL current tables and represent the complete database
-# schema after applying the current query.
+# REQUEST TYPES:
+# Internally classify CREATE, ALTER, DROP, RETAIN/REVERT. Do not print the type.
+# CREATE preserves existing active tables and adds the requested object.
+# ALTER preserves every existing table/column/constraint/Ref and changes only
+# what was requested. DROP removes only the requested active object and its
+# invalid Refs. RETAIN/REVERT restores the last complete dropped definition;
+# if a restored table depends on a dropped referenced table, restore that
+# required dependency too. Explicit CREATE after DROP creates the newly requested
+# schema and must not silently restore old columns.
 
-# 1. SUMMARY
-# - Combine the existing summary with the current query.
-# - Preserve important previous requests and context.
-# - Add the current request to the summary.
-# - Summarize user intent and requested database operations.
-# - Do not represent the summary as the database schema.
-# - Do not remove previous context unless the current query explicitly
-#   changes or reverses it.
-# - Keep the summary concise but sufficient for future queries.
+# FOREIGN KEYS:
+# Preserve the complete source table. Add the FK column if missing. If the target
+# does not exist, create it with id int [pk]. Use only fully-qualified standalone
+# Refs: Ref: source.column > target.column. Ref statements must be outside tables.
 
-# 2. DBML
-# - Generate valid DBML based on the existing context and current query.
-# - Apply only the change requested in the current query.
-# - ALWAYS return ALL current tables in the DBML.
-# - Preserve every existing table, column, primary key, foreign key,
-#   constraint, and relationship unless the current query explicitly
-#   changes or removes it.
-# - Never return only the affected table.
-# - Never remove existing schema because it was not mentioned in the
-#   current query.
-# - Never duplicate an existing table.
+# DBML:
+# Always return every currently active table, every known current column,
+# constraint and valid Ref. Never duplicate a table. One column per line; no
+# comma-separated fields.
 
-# CREATE:
-# - Create the requested table with all requested columns and constraints.
-# - Preserve all existing tables.
+# SUMMARY MEMORY:
+# SUMMARY is the memory for the NEXT request, so it must never lose exact schema
+# information. Keep it on ONE physical line with this form:
+# Request Summary: <compact chronological actions, including complete last-known
+# definitions for dropped objects needed by a future retain>. Current Structure:
+# <complete active tables, columns, datatypes, PK/FK/constraints and Refs>.
+# When dropping, keep the dropped table's complete last definition in Request
+# Summary while removing it from Current Structure. Preserve prior meaningful
+# history and append the current action. No newline/tab characters in SUMMARY.
 
-# ALTER:
-# - Find the existing table from the context.
-# - Preserve its complete existing schema.
-# - Add or modify only what the current query requests.
-# - Preserve all other tables unchanged.
-# - Do not rebuild the table using only fields mentioned in the current query.
+# EXPLANATION:
+# Explain only the current request in one concise physical line. No newline/tab.
 
-# DROP:
-# - Remove the requested table from the active DBML.
-# - Remove relationships involving the dropped table.
-# - Preserve all unrelated tables and relationships.
-# - IMPORTANT: A dropped table is still part of the conversation context.
-# - Preserve enough information about the dropped table to allow a later
-#   RETAIN request to restore its COMPLETE previous schema.
-
-# RETAIN:
-# - Identify the table requested for retention from the existing context.
-# - If the table was previously dropped, restore it to the DBML.
-# - Restore the COMPLETE schema the table had immediately before it was dropped.
-# - Restore ALL of its previous columns.
-# - Restore its primary keys.
-# - Restore its foreign-key columns and constraints.
-# - Restore its valid relationships.
-# - Do NOT recreate the table using only information mentioned in the
-#   current RETAIN request.
-# - Do NOT create a simplified version of the table.
-# - Do NOT lose columns that were present before DROP.
-# - Do NOT create duplicate copies of the table.
-# - After restoring the table, include it together with ALL other current
-#   tables in the DBML.
-# - Restore relationships only when their referenced/source tables exist.
-# - If a relationship cannot currently be restored because its referenced
-#   table does not exist, preserve the table and omit only that invalid
-#   relationship.
-
-# FOREIGN KEY:
-# - Identify the source table, foreign-key column, and referenced table.
-# - Add the foreign-key column to the source table.
-# - If the SOURCE table does not exist, create it with ONLY:
-#     id int [pk]
-#   Then add the requested foreign-key column.
-# - If the REFERENCED table does not exist, create it with ONLY:
-#     id int [pk]
-# - Do not add any other columns to a newly created table unless the
-#   current query explicitly requests them.
-# - Both source and referenced tables must exist in the DBML.
-# - Add the relationship as a separate Ref statement at the end of DBML.
-# - Use this format:
-#   Ref: <source_table>.<foreign_key_column> > <target_table>.<target_column>
-# - Do not use [ref: > ...] inside the column definition.
-# - Preserve all existing foreign keys and relationships.
-
-# REFERENCES:
-# - Resolve phrases such as "the table", "this table", "that table",
-#   "previous table", or omitted table names using the existing context
-#   and current query.
-# - If the current query refers to an existing or previously dropped table,
-#   identify it from the context.
-# - Do not invent unrelated tables or schema.
-
-# DBML COMPLETENESS:
-# - ALWAYS return every current table.
-# - Preserve every existing table that has not been dropped.
-# - Preserve every existing column.
-# - Preserve every existing primary key and constraint.
-# - Preserve every valid relationship.
-# - Include every table required by a new foreign key.
-# - Include every table restored by RETAIN.
-# - Include every requested change.
-# - Only changes requested by the current query may modify the schema.
-
-# 3. EXPLANATION
-# - Explain the changes made for the CURRENT QUERY only.
-# - Clearly describe:
-#   - tables created, modified, dropped, or retained
-#   - columns added, modified, or removed
-#   - keys or constraints added or changed
-#   - foreign-key relationships created, modified, or removed
-#   - supporting tables created because they were required
-# - For RETAIN:
-#   - identify the restored table
-#   - explain that its previous complete schema was restored
-#   - mention the restored columns, keys, constraints, and relationships
-#   - explain any relationship that could not be restored and why
-# - If a missing table was created for a foreign-key operation, explain
-#   that it was created with only id as the primary key.
-# - Do not describe unrelated previous changes.
-# - Do not simply repeat the DBML.
-# - Explain the current change clearly and in sufficient detail for a
-#   developer to understand what happened.
-
-# OUTPUT FORMAT:
-# Return ONLY valid JSON in exactly this structure:
-
+# OUTPUT:
+# Return ONLY valid JSON with exactly:
 # {
-#   "summary": "<updated conversation summary>",
-#   "dbml": "<complete DBML containing ALL current tables>",
-#   "explanation": "<detailed explanation of the current query change>"
+#   "summary": "...",
+#   "dbml": "...",
+#   "explanation": "..."
 # }
-
-# Do not return markdown fences.
-# Do not return SQL.
-# Do not return additional fields.
-# Do not return any text outside the JSON object.
+# No markdown fences and no text outside the JSON object.
 # """
 
 DBML_SYSTEM_PROMPT = """
 You are a database schema assistant.
-
+ 
 INPUT:
 - EXISTING_SUMMARY: previous request history and schema context.
 - EXISTING_DBML: exact current database schema.
 - CURRENT_QUERY: latest user request.
-
+ 
 Use EXISTING_SUMMARY only as context/history.
 Use EXISTING_DBML as the exact schema source of truth.
 Apply only CURRENT_QUERY.
-
+ 
 Return ONLY:
 {
   "summary": "Request Summary: ...\\nCurrent Structure: ...",
   "dbml": "...",
   "explanation": "..."
 }
-
+ 
 SUMMARY:
 Rebuild the summary from EXISTING_SUMMARY + CURRENT_QUERY after every request.
-
+ 
 Request Summary:
 - Preserve all meaningful previous actions and schema information.
 - Append the current request/result.
 - Preserve CREATE, ALTER, DROP, RETAIN, tables, columns, constraints and relationships.
-
+ 
 Current Structure:
 - Describe the COMPLETE resulting schema.
 - Include every current table, column, important constraint and relationship.
 - It must match the resulting DBML.
 - Include tables automatically created by the current request.
 - Do not include dropped tables.
-
+ 
 Keep the summary concise without losing meaningful information.
-
+ 
 DBML:
 Always return the COMPLETE resulting schema.
 Preserve every unaffected table, column, key, constraint and relationship.
 Never duplicate tables.
-
+ 
 CREATE:
 Add the requested table/columns and preserve existing schema.
-
+ 
 ALTER:
 Change only what CURRENT_QUERY requests.
 Preserve the complete affected table and all unrelated schema.
-
+ 
 DROP:
 Remove ONLY the requested table(s).
 Remove their constraints and Ref relationships.
@@ -216,14 +130,14 @@ Preserve every unrelated table unchanged.
 If any table remains, DBML MUST contain those tables.
 Return empty DBML only when no tables remain.
 Keep the DROP action in Request Summary.
-
+ 
 RETAIN / REVERT:
 Restore the requested dropped/reverted table using its most recent complete
 definition available in context.
 Restore columns, keys, constraints, FK columns and valid relationships.
 Preserve all other current tables.
 Record the action in Request Summary.
-
+ 
 FOREIGN KEY / REFERENCE:
 Add the FK column if missing.
 If source table does not exist, create it with:
@@ -236,18 +150,18 @@ Ref: source_table.source_column > target_table.target_column
 Put Ref statements after all Table blocks.
 Never put Ref inside a Table block or use inline [ref].
 Do not create unrelated columns.
-
+ 
 REFERENCES:
 Resolve "this", "that", "the table", "those tables", and similar references
 using EXISTING_DBML first, then EXISTING_SUMMARY.
-
+ 
 EXPLANATION:
-Explain only CURRENT_QUERY.
-Mention relevant created, changed, dropped, retained/restored tables,
-columns, constraints and relationships.
-Mention automatically created FK tables.
-Keep concise and complete.
-
+Explain only the actual change made by CURRENT_QUERY in 1-2 detailed sentences.
+Mention the affected table, columns, constraints, relationships, and automatically
+created tables only when directly related to CURRENT_QUERY.
+Do not mention previous requests, existing schema, unchanged objects, summary,
+history, or unrelated changes
+ 
 OUTPUT:
 - Exactly summary, dbml and explanation.
 - summary always contains Request Summary and Current Structure.
@@ -257,84 +171,15 @@ OUTPUT:
 - No markdown, extra fields or text outside JSON.
 """
 
+def build_user_prompt(enable_summary: bool, summary: str, user_query: str) -> str:
+    existing_summary = (summary or "").strip() if enable_summary else ""
+    if not existing_summary:
+        existing_summary = "NO PREVIOUS SUMMARY"
 
-def call_llm(
-    ai: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-    system_prompt: str,
-    user_prompt: str,
-):
-    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi",):
-        raise ValueError(f"Unsupported AI provider: {ai}")
-
-    try:
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.1,
-            reasoning_effort='medium',
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-        )
-    except Exception as exc:
-        logger.exception("LLM request failed for provider %s", ai)
-        raise RuntimeError("LLM request failed") from exc
-
-    if not response.choices or not response.choices[0].message.content:
-        raise RuntimeError("LLM returned an empty response")
-
-    logger.info("response: %s", response.choices[0].message.content.strip())
-    logger.info("Prompt tokens: %s", response.usage.prompt_tokens)
-    logger.info("Completion tokens: %s", response.usage.completion_tokens)
-    logger.info("Total tokens: %s", response.usage.total_tokens)
-
-    return response.choices[0].message.content.strip()
-
-
-def generate_dbml_response(
-    enable_summary: bool,
-    summary: str,
-    user_query: str,
-    dbml: str,
-    ai: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-):
-    prompt = f"""
-        Existing summary:
-        {summary if enable_summary and summary else "Summary disabled."}
-
-        Current DBML:
-        {dbml or "No existing DBML."}
-
-        User request:
-        {user_query}
-
-        Summary enabled: {enable_summary}
-    """
-
-    return call_llm(
-        ai=ai,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        system_prompt=DBML_SYSTEM_PROMPT,
-        user_prompt=prompt
+    return (
+        f"EXISTING_SUMMARY:\n{existing_summary}\n\n"
+        f"CURRENT_QUERY:\n{user_query.strip()}\n\n"
+        f"SUMMARY_ENABLED:\n{enable_summary}"
     )
 
 
@@ -359,42 +204,101 @@ def validate_access_token(db: Session, token: str) -> RegisterApplication:
 
 
 def generate_dbml(
+    db: Session,
     user_query: str,
-    ai: str,
-    model: str,
-    encrypted_api_key: str,
-    base_url: str,
     enable_summary: bool = False,
     summary: str = "",
-    dbml: str = "",
-):
-    
-    try:
-        encrypt_key = settings.API_KEY_ENCRYPTION_KEY
-        api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
-    except Exception as exc:
-        logger.exception("Failed to decrypt the LLM API key")
-        raise ValueError("Invalid encrypted LLM API key") from exc
+    direct_model: str | None = None,
+    llm: str | None = None,
+    llm_api_key: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    user_prompt = build_user_prompt(
+        enable_summary=enable_summary,
+        summary=summary,
+        user_query=user_query,
+    )
 
-    try:
-        llm_response = generate_dbml_response(
-            enable_summary=enable_summary,
-            summary=summary,
-            user_query=user_query,
-            dbml=dbml,
-            ai=ai,
-            model=model,
-            api_key=api_key,
+    estimated_tokens = estimate_tokens(DBML_SYSTEM_PROMPT + "\n" + user_prompt)
+
+    if direct_model and llm and llm_api_key and base_url:
+        call = call_direct_model(
+            model_name=llm,
+            api_key=llm_api_key,
             base_url=base_url,
+            system_prompt=DBML_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
         )
-        result = parse_dbml_response(llm_response)
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.exception("Failed to generate DBML response")
-        raise RuntimeError("Failed to generate DBML response") from exc
+        result = parse_dbml_response(call.content)
+        if not enable_summary:
+            result["updated_summary"] = None
+        result["used_tokens"] = call.total_tokens
+        return result
 
-    if not enable_summary:
-        result["updated_summary"] = None
+    candidates = get_candidate_models(db, estimated_tokens=estimated_tokens)
 
-    return result
+    if not candidates:
+        raise NoAvailableLLMError(
+            "No LLM fallback model currently has enough RPM/TPM/RPD/TPD capacity."
+        )
+
+    failures: list[str] = []
+
+    for position, model in enumerate(candidates, start=1):
+        logger.info(
+            "Trying LLM fallback position=%s model=%s estimated_tokens=%s",
+            position,
+            model.llm_model,
+            estimated_tokens,
+        )
+
+        try:
+            call = call_model(
+                model=model,
+                system_prompt=DBML_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+
+            # Provider usage counts even when parsing/validation fails.
+            record_success(db, model, call.total_tokens)
+
+            result = parse_dbml_response(call.content)
+            if not enable_summary:
+                result["updated_summary"] = None
+            result["used_tokens"] = call.total_tokens
+
+            logger.info(
+                "LLM selected model=%s fallback_used=%s total_tokens=%s",
+                model.llm_model,
+                position > 1,
+                call.total_tokens,
+            )
+            return result
+
+        except ValueError as exc:
+            # Invalid generated format: try the next generation model.
+            failures.append(f"{model.llm_model}: invalid response: {exc}")
+            logger.warning("Invalid LLM response model=%s error=%s", model.llm_model, exc)
+            continue
+
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                record_rate_limit(db, model, exc)
+                failures.append(f"{model.llm_model}: rate limited")
+                continue
+
+            if is_auth_or_model_error(exc):
+                record_unavailable(db, model, str(exc))
+                failures.append(f"{model.llm_model}: unavailable")
+                continue
+
+            if is_retryable_provider_error(exc):
+                failures.append(f"{model.llm_model}: transient provider error: {exc}")
+                logger.warning("Transient LLM error model=%s error=%s", model.llm_model, exc)
+                continue
+
+            raise
+
+    raise NoAvailableLLMError(
+        "All available LLM fallback models failed. " + "; ".join(failures)
+    )

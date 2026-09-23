@@ -41,24 +41,42 @@ def _json_safe(value):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = str(exc.detail)
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "message": str(exc.detail),
+            "message": detail,
             "status_code": exc.status_code,
-            "error": str(exc.detail),
+            "data": {"error": detail},
         },
     )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = _json_safe(exc.errors())
+    message = "Invalid request payload"
+    if errors and isinstance(errors[0], dict) and errors[0].get("msg"):
+        message = str(errors[0]["msg"])
+
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "message": "Invalid request payload",
+            "message": message,
             "status_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "error": _json_safe(exc.errors()),
+            "data": {"error": message, "details": errors},
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "message": "Internal server error",
+            "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "data": {"error": str(exc)},
         },
     )
 
@@ -66,7 +84,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/health")
 def health():
     return {
-        "msg": "LLM Gateway is running",
-        "status": status.HTTP_200_OK,
+        "message": "LLM Gateway is running",
+        "status_code": status.HTTP_200_OK,
         "data": {},
     }
