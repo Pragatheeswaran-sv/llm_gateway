@@ -1,4 +1,8 @@
+from urllib.parse import urlsplit
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+SUPPORTED_PROVIDERS = {"groq", "gemini"}
 
 
 class DBMLGenerateRequest(BaseModel):
@@ -34,6 +38,34 @@ class DBMLGenerateRequest(BaseModel):
             if value is not None:
                 stripped = value.strip()
                 setattr(self, name, stripped or None)
+
+        if self.model and self.model.lower() not in SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
+            raise ValueError(
+                f"Unsupported provider '{self.model}'. Supported providers: {supported}."
+            )
+
+        if self.base_url:
+            try:
+                url = urlsplit(self.base_url)
+                valid = (
+                    url.scheme in {"http", "https"}
+                    and bool(url.hostname)
+                    and url.username is None
+                    and url.password is None
+                    and not url.query
+                    and not url.fragment
+                    and not any(char.isspace() for char in self.base_url)
+                )
+                url.port  # Validate the port, if supplied.
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError(
+                    "base_url must be a plain HTTP or HTTPS URL without credentials, "
+                    "query parameters, or fragments; do not use Markdown link formatting"
+                )
+
         return self
 
 

@@ -42,10 +42,14 @@ def _json_safe(value):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     detail = str(exc.detail)
+    message = detail
+    if isinstance(exc.detail, dict) and {"message", "error"} <= exc.detail.keys():
+        message = str(exc.detail["message"])
+        detail = str(exc.detail["error"])
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "message": detail,
+            "message": message,
             "status_code": exc.status_code,
             "data": {"error": detail},
         },
@@ -56,15 +60,25 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = _json_safe(exc.errors())
     message = "Invalid request payload"
-    if errors and isinstance(errors[0], dict) and errors[0].get("msg"):
-        message = str(errors[0]["msg"])
+
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        first_error = errors[0]
+        context = first_error.get("ctx")
+        context_error = context.get("error") if isinstance(context, dict) else None
+        message = str(context_error or first_error.get("msg") or message)
+        if message.startswith("Value error, "):
+            message = message.removeprefix("Value error, ")
+        location = first_error.get("loc", ())
+        field = ".".join(str(part) for part in location if part != "body")
+        if field:
+            message = f"{field}: {message}"
 
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "message": message,
             "status_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "data": {"error": message, "details": errors},
+            "data": {"error": message},
         },
     )
 
@@ -79,7 +93,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "data": {"error": str(exc)},
         },
     )
-
 
 @app.get("/health")
 def health():

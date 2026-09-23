@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
-from src.conversation.fallback import NoAvailableLLMError, ProviderRequestError
+from src.conversation.fallback import (
+    InvalidDirectAPIKeyError,
+    NoAvailableLLMError,
+    ProviderRequestError,
+)
 from src.conversation.schemas import (
     DBMLGenerateData,
     DBMLGenerateRequest,
@@ -61,8 +65,10 @@ def generate_dbml_endpoint(
     except ProviderRequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
+            detail={"message": exc.message, "error": str(exc)},
         ) from exc
+    except InvalidDirectAPIKeyError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

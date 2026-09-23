@@ -3,7 +3,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,12 @@ class NoAvailableLLMError(RuntimeError):
 
 
 class ProviderRequestError(RuntimeError):
+    def __init__(self, error: str, message: str = "The LLM provider request failed."):
+        super().__init__(error)
+        self.message = message
+
+
+class InvalidDirectAPIKeyError(ValueError):
     pass
 
 
@@ -214,9 +220,19 @@ def call_direct_model(
     system_prompt: str,
     user_prompt: str,
 ) -> LLMCallResult:
+    if not settings.API_KEY_ENCRYPTION_KEY:
+        raise InvalidDirectAPIKeyError("API_KEY_ENCRYPTION_KEY is not configured")
+
+    try:
+        decrypted_api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
+    except Exception as exc:
+        raise InvalidDirectAPIKeyError(
+            "llm_api_key must be a valid encrypted API key"
+        ) from exc
+
     try:
         return _call_openai_model(
-            api_key=api_key,
+            api_key=decrypted_api_key,
             base_url=base_url,
             model_name=model_name,
             system_prompt=system_prompt,
@@ -224,14 +240,55 @@ def call_direct_model(
         )
     except Exception as exc:
         status_code = _status_code(exc)
+        provider_message = _provider_error_message(exc)
+        for secret in (api_key, decrypted_api_key):
+            if secret:
+                provider_message = provider_message.replace(secret, "[redacted]")
+        message = {
+            400: "The provider rejected the request. Check llm and base_url.",
+            401: "The provider rejected llm_api_key. Check the API key and base_url.",
+            403: "Provider access was denied. Check llm_api_key permissions and llm access.",
+            404: "The requested model or endpoint is unavailable. Check llm and base_url.",
+            422: "The provider could not process the request. Check llm and request values.",
+            429: "The provider rate limit or quota was exceeded. Try again later or check your quota.",
+        }.get(status_code, "The LLM provider request failed.")
+        if isinstance(exc, APITimeoutError):
+            message = "The provider request timed out. Check base_url or try again later."
+        elif isinstance(exc, APIConnectionError):
+            message = "Could not connect to the provider. Check base_url and network connectivity."
+        elif status_code is not None and status_code >= 500:
+            message = "The provider encountered a server error. Try again later."
         if status_code is not None:
             raise ProviderRequestError(
-                f"Provider request failed with HTTP {status_code} for model "
-                f"'{model_name}' at '{base_url}': {exc}"
+                f"Provider HTTP {status_code}: {provider_message}", message=message
             ) from exc
         raise ProviderRequestError(
-            f"Provider request failed for model '{model_name}' at '{base_url}': {exc}"
+            provider_message, message=message
         ) from exc
+
+
+def _provider_error_message(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if body.get("message"):
+            return str(body["message"])
+
+    response = getattr(exc, "response", None)
+    response_json = getattr(response, "json", None)
+    if callable(response_json):
+        try:
+            payload = response_json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"])
+
+    return str(exc)
 
 
 def record_success(db: Session, model: LLMFallbackModel, total_tokens: int) -> None:
