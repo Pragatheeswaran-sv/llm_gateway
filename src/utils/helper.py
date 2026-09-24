@@ -65,7 +65,19 @@ def normalize_llm_text(value: str) -> str:
     )
 
 
-def parse_dbml_response(response: str) -> dict[str, str]:
+VALID_LLM_INTENTS = {
+    "SCHEMA",
+    "RELATED",
+    "GREETING",
+    "FAREWELL",
+    "ACKNOWLEDGEMENT",
+    "UNRELATED",
+}
+
+
+def parse_dbml_response(
+    response: str, include_intent: bool = False
+) -> dict[str, str]:
     response = response.strip()
 
     try:
@@ -77,18 +89,27 @@ def parse_dbml_response(response: str) -> dict[str, str]:
         dbml = payload.get("dbml")
         summary = payload.get("summary")
         explanation = payload.get("explanation")
+        intent = payload.get("intent", "SCHEMA")
 
-        if not all(isinstance(value, str) for value in (dbml, summary, explanation)):
+        if not all(
+            isinstance(value, str) for value in (dbml, summary, explanation, intent)
+        ):
             raise ValueError("Invalid DBML response format from LLM.")
 
-        if not summary.strip() or not explanation.strip():
+        if intent not in VALID_LLM_INTENTS:
+            raise ValueError("Invalid LLM intent.")
+
+        if not explanation.strip() or (intent == "SCHEMA" and not summary.strip()):
             raise ValueError("Invalid DBML response from LLM.")
 
-        return {
+        result = {
             "dbml_query": (dbml).strip(),
             "updated_summary": normalize_llm_text(summary).strip(),
             "explanation": (explanation).strip(),
         }
+        if include_intent:
+            result["intent"] = intent
+        return result
 
     if "```" in response or "\\n" in response or "\\t" in response:
         raise ValueError("Invalid DBML response format from LLM.")
@@ -109,11 +130,14 @@ def parse_dbml_response(response: str) -> dict[str, str]:
     if not summary or not explanation:
         raise ValueError("Invalid DBML response from LLM.")
 
-    return {
+    result = {
         "dbml_query": dbml,
         "updated_summary": summary,
         "explanation": explanation,
     }
+    if include_intent:
+        result["intent"] = "SCHEMA"
+    return result
 
 
 def generate_client_id() -> str:

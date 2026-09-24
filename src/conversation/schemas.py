@@ -22,6 +22,7 @@ class DBMLGenerateData(BaseModel):
     dbml_query: str
     updated_summary: str | None
     explanation: str
+    token_used: int | None
 
 
 class DBMLGenerateResponse(BaseModel):
