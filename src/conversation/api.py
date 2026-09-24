@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
+from uuid import uuid4
 
 from src.conversation.fallback import (
     InvalidDirectAPIKeyError,
@@ -31,6 +32,7 @@ def generate_dbml_endpoint(
         )
 
     token = authorization.split(" ", 1)[1].strip()
+    request_id = uuid4()
     try:
         validate_access_token(db, token)
     except ValueError as exc:
@@ -55,6 +57,7 @@ def generate_dbml_endpoint(
         return DBMLGenerateResponse(
             message="DBML generated successfully",
             status_code=status.HTTP_200_OK,
+            request_id=request_id,
             data=DBMLGenerateData(**result),
         )
 
@@ -62,15 +65,17 @@ def generate_dbml_endpoint(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
+            headers={"X-Request-ID": str(request_id)},
         ) from exc
     except ProviderRequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"{exc.message} {exc}",
+            headers={"X-Request-ID": str(request_id)},
         ) from exc
     except InvalidDirectAPIKeyError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc), headers={"X-Request-ID": str(request_id)}) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc), headers={"X-Request-ID": str(request_id)}) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=str(exc), headers={"X-Request-ID": str(request_id)}) from exc

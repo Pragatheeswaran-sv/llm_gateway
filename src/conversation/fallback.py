@@ -14,7 +14,8 @@ from src.utils.helper import decrypt_api_key
 logger = logging.getLogger(__name__)
 
 # Reserve output capacity during the pre-call TPM/TPD check.
-DEFAULT_OUTPUT_TOKEN_RESERVE = 800
+DEFAULT_OUTPUT_TOKEN_RESERVE = 300
+DEFAULT_TEMPERATURE = 0.2
 ACCOUNT_TURN = Sequence("llm_fallback_account_turn", start=1)
 
 
@@ -119,7 +120,11 @@ def _is_eligible(model: LLMFallbackModel, estimated_tokens: int, now: datetime) 
     return True, None
 
 
-def get_candidate_models(db: Session, estimated_tokens: int) -> list[LLMFallbackModel]:
+def get_candidate_models(
+    db: Session,
+    estimated_tokens: int,
+    skipped_models: list[tuple[LLMFallbackModel, str]] | None = None,
+) -> list[LLMFallbackModel]:
     now = utcnow()
     models = list(
         db.scalars(
@@ -161,6 +166,8 @@ def get_candidate_models(db: Session, estimated_tokens: int) -> list[LLMFallback
         if ok:
             eligible.append(model)
         else:
+            if skipped_models is not None:
+                skipped_models.append((model, reason or "INELIGIBLE"))
             logger.info(
                 "Skipping fallback priority=%s model=%s reason=%s rpm=%s/%s tpm=%s/%s rpd=%s/%s tpd=%s/%s",
                 model.priority,
@@ -189,7 +196,7 @@ def _call_openai_model(
     client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.chat.completions.create(
         model=model_name,
-        temperature=0.1,
+        temperature=DEFAULT_TEMPERATURE,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -314,13 +321,21 @@ def record_success(db: Session, model: LLMFallbackModel, total_tokens: int) -> N
     now = utcnow()
     _reset_windows(model, now)
 
-    model.used_requests += 1
     model.used_tokens += max(0, total_tokens)
-    model.minute_requests += 1
     model.minute_tokens += max(0, total_tokens)
     model.last_used_at = now
     model.is_rate_limited = False
     model.cooldown_until = None
+    db.commit()
+
+
+def record_attempt(db: Session, model: LLMFallbackModel) -> None:
+    """Count a provider call even when it fails before returning token usage."""
+    now = utcnow()
+    _reset_windows(model, now)
+    model.used_requests += 1
+    model.minute_requests += 1
+    model.last_used_at = now
     db.commit()
 
 
