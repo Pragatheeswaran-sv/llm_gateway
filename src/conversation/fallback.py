@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
-from sqlalchemy import select
+from sqlalchemy import select, Sequence
 from sqlalchemy.orm import Session
 
 from src.conversation.models import LLMFallbackModel
@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 # Reserve output capacity during the pre-call TPM/TPD check.
 DEFAULT_OUTPUT_TOKEN_RESERVE = 800
+ACCOUNT_TURN = Sequence("llm_fallback_account_turn", start=1)
+
+
+
+def _next_account_turn(db: Session) -> int:
+    """PostgreSQL nextval allocates a unique turn across processes/workers.
+
+    Sequence increments survive rollback; a cancelled request may consume a turn.
+    """
+    return db.scalar(select(ACCOUNT_TURN.next_value())) - 1
 
 
 class NoAvailableLLMError(RuntimeError):
@@ -116,6 +126,7 @@ def get_candidate_models(db: Session, estimated_tokens: int) -> list[LLMFallback
             select(LLMFallbackModel).where(
                 LLMFallbackModel.status == "ACTIVE",
                 LLMFallbackModel.is_active.is_(True),
+                LLMFallbackModel.priority > 0,
             )
         ).all()
     )
@@ -127,14 +138,20 @@ def get_candidate_models(db: Session, estimated_tokens: int) -> list[LLMFallback
     if changed:
         db.commit()
 
-    # Select the most capable eligible rows without a model-specific order.
+    if not models:
+        return []
+
+    # Allocate once per request, before filtering capacity. Database priorities
+    # define the entire route order, independent of model names or credentials.
+    # An unavailable row falls through to the next priority, wrapping at the end.
+    priorities = sorted({model.priority for model in models})
+    offset = _next_account_turn(db) % len(priorities)
+    priorities = priorities[offset:] + priorities[:offset]
+    priority_order = {priority: index for index, priority in enumerate(priorities)}
     models.sort(
         key=lambda item: (
-            -(item.daily_token_limit - item.used_tokens),
-            -(item.tpm_limit - item.minute_tokens),
-            -(item.rpm_limit - item.minute_requests),
-            item.used_requests,
-            item.llm_model,
+            priority_order[item.priority],
+            str(item.id),
         )
     )
 
@@ -145,7 +162,8 @@ def get_candidate_models(db: Session, estimated_tokens: int) -> list[LLMFallback
             eligible.append(model)
         else:
             logger.info(
-                "Skipping fallback model=%s reason=%s rpm=%s/%s tpm=%s/%s rpd=%s/%s tpd=%s/%s",
+                "Skipping fallback priority=%s model=%s reason=%s rpm=%s/%s tpm=%s/%s rpd=%s/%s tpd=%s/%s",
+                model.priority,
                 model.llm_model,
                 reason,
                 model.minute_requests,

@@ -40,6 +40,7 @@ class LLMFallbackModel(Base):
     llm_model = Column(String(255), nullable=False)
     api_base_url = Column(String(500), nullable=False)
     api_key = Column(String(1000), nullable=False)
+    priority = Column(Integer, nullable=True)
     daily_token_limit = Column(BigInteger, nullable=False)
     used_tokens = Column(BigInteger, nullable=False, default=0)
     daily_request_limit = Column(Integer, nullable=False)
