@@ -45,8 +45,7 @@ jobs:
       - name: Deploy Service to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID || '424a0bef-4982-48c0-a9e4-34db92b48ac5' }}
-          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID || '0628b995-3d49-4b99-8904-3af36e6ffdbf' }}
+          RAILWAY_PROJECT_ID: "424a0bef-4982-48c0-a9e4-34db92b48ac5"
         run: |
           echo "Deploying LLM Gateway to Railway..."
-          railway up --ci
+          railway up --service "llm-gateway" --ci
