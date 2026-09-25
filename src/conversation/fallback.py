@@ -246,15 +246,16 @@ def call_direct_model(
     system_prompt: str,
     user_prompt: str,
 ) -> LLMCallResult:
-    if not settings.API_KEY_ENCRYPTION_KEY:
-        raise InvalidDirectAPIKeyError("API_KEY_ENCRYPTION_KEY is not configured")
+    if not api_key or not api_key.strip():
+        raise InvalidDirectAPIKeyError("llm_api_key is required")
 
-    try:
-        decrypted_api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
-    except Exception as exc:
-        raise InvalidDirectAPIKeyError(
-            "llm_api_key must be a valid encrypted API key"
-        ) from exc
+    decrypted_api_key = api_key
+    if settings.API_KEY_ENCRYPTION_KEY:
+        try:
+            decrypted_api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
+        except Exception:
+            # Direct requests may provide either an encrypted or provider-native key.
+            decrypted_api_key = api_key
 
     try:
         return _call_openai_model(

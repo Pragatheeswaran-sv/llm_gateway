@@ -23,7 +23,7 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from src.register_application.models import RegisterApplication
-from src.utils.helper import decode_access_token, decrypt_api_key, parse_dbml_response
+from src.utils.helper import decode_access_token, parse_dbml_response
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -813,13 +813,6 @@ def generate_dbml(
     base_url: str | None = None,
     dbml: str = "",
 ) -> dict:
-    try:
-        encrypt_key = settings.API_KEY_ENCRYPTION_KEY
-        encrypted_api_key = llm_api_key 
-        api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
-    except Exception as exc:
-        logger.exception("Failed to decrypt the LLM API key")
-        raise ValueError("Invalid API key format") from exc
     user_prompt = build_user_prompt(
         enable_summary=enable_summary,
         summary=summary,
