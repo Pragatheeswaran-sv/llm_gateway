@@ -1,39 +1,12 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Virtual environment
+.env
 .venv/
 venv/
-env/
-
-# Environment variables
-.env
-.env.*
-!.env.example
-
-# Testing
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
-*.log
-
-# IDE
-.vscode/
 .idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Build / distribution
-dist/
-build/
-*.egg-info/
-
-# Alembic
-*.db
-
-# Poetry (keep poetry.lock committed)
-poetry.toml
+.vscode/
+.kilo
+tests/
