@@ -50,4 +50,5 @@ jobs:
           echo "Deploying LLM Gateway to Railway..."
           railway up \
             --service "${{ secrets.RAILWAY_SERVICE_NAME || 'llm-gateway' }}" \
+            --environment "${{ secrets.RAILWAY_ENVIRONMENT || 'production' }}" \
             --ci
