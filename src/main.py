@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from src.config import settings
+from src.database import Base, engine
 from src.conversation.api import router as conversation_router
 from src.register_application.api import router as application_router
 
@@ -17,6 +18,11 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        Base.metadata.create_all(bind=engine)
+        logging.info("Database tables verified/created successfully.")
+    except Exception as e:
+        logging.error(f"Failed to create database tables: {e}")
     yield
 
 
@@ -64,6 +70,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+@app.get("/health_check")
 @app.get("/health")
 def health():
     return {
