@@ -2,7 +2,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SUPPORTED_PROVIDERS = {"groq", "openai", "gemini", "claude", "kimi"}
+SUPPORTED_PROVIDERS = {"groq", "openai", "gemini", "claude", "kimi", "freellmapi"}
 
 
 class DBMLGenerateRequest(BaseModel):

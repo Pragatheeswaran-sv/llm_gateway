@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Reserve output capacity during the pre-call TPM/TPD check.
 DEFAULT_OUTPUT_TOKEN_RESERVE = 300
-DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TEMPERATURE = 0.1
 ACCOUNT_TURN = Sequence("llm_fallback_account_turn", start=1)
 
 

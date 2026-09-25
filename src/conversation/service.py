@@ -614,7 +614,7 @@ def call_llm(
     system_prompt: str,
     user_prompt: str,
 ):
-    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi",):
+    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi","freellmapi"):
         raise ValueError(f"Unsupported AI provider: {ai}")
 
     try:
@@ -652,8 +652,10 @@ def call_llm(
     logger.info("Prompt tokens: %s", usage.prompt_tokens if usage else None)
     logger.info("Completion tokens: %s", usage.completion_tokens if usage else None)
     logger.info("Total tokens: %s", token_used)
-
+    logger.info("LLM request completed successfully for provider %s", ai)
+    logger.info("response: %s", response.choices[0].message.content.strip())
     return response.choices[0].message.content.strip(), token_used
+
 
 
 def generate_dbml_response(
@@ -744,7 +746,6 @@ def _start_attempt(
         minute_tokens=fallback_model.minute_tokens if fallback_model else None,
     )
     db.add(row)
-    # Persist before calling the provider so failed attempts remain auditable.
     db.commit()
     db.refresh(row)
     return row
@@ -806,7 +807,7 @@ def generate_dbml(
     user_query: str,
     enable_summary: bool = False,
     summary: str = "",
-    direct_model: str | None = None,
+    model: str | None = None,
     llm: str | None = None,
     llm_api_key: str | None = None,
     base_url: str | None = None,
@@ -820,12 +821,21 @@ def generate_dbml(
         raise ValueError("Invalid encrypted LLM API key") from exc
 
     try:
+        if model is None:
+            raise ValueError("Model is required")
+        if llm is None:
+            raise ValueError("LLM provider is required")
+        if base_url is None:
+            raise ValueError("Base URL is required")
+        if llm_api_key is None:
+            raise ValueError("LLM API key is required")
+
         llm_response, token_used = generate_dbml_response(
             enable_summary=enable_summary,
             summary=summary,
             user_query=user_query,
             dbml=dbml,
-            ai=ai,
+            ai=llm,
             model=model,
             api_key=api_key,
             base_url=base_url,

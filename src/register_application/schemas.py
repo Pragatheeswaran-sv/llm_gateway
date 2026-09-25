@@ -8,8 +8,8 @@ T = TypeVar("T")
 
 
 class ApiResponse(BaseModel, Generic[T]):
-    msg: str
-    status: int
+    message: str
+    status_code: int
     data: T
 
 
