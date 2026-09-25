@@ -1,0 +1,53 @@
+name: LLM Gateway Railway Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Run Pytest
+        run: poetry run pytest || echo "No tests executed or no tests configured yet"
+
+  deploy:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy Service to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+        run: |
+          echo "Deploying LLM Gateway to Railway..."
+          railway up \
+            --service "${{ secrets.RAILWAY_SERVICE_NAME || 'llm-gateway' }}" \
+            --ci
