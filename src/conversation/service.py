@@ -220,7 +220,18 @@ sessions = {}
 # Preserve every unaffected table, column, key, constraint and relationship.
 # Never duplicate tables.
 
+# TYPES:
+# - Infer types from the column meaning: text -> `varchar`; IDs, counts, and foreign keys -> `int`.
+# - Money fields (salary, price, amount, balance, discount) -> `decimal`; date fields -> `date`.
+# - Honor an explicitly requested type. Never use `string` or `integer`.
+
+# SCOPE:
+# - Only process CREATE, ALTER, DROP, REVERT, or RETAIN requests.
+# - Treat ADD and REMOVE as ALTER requests.
+# - For irrelevant input, leave DBML and summary unchanged and set explanation to: "Irrelevant to the conversation."
+
 # CREATE:
+# Use `Table` and `Ref:` exactly. Never use lowercase `table` or `ref`.
 # Add the requested table/columns and preserve existing schema.
 
 # ALTER:
@@ -260,11 +271,11 @@ sessions = {}
 # using EXISTING_DBML first, then EXISTING_SUMMARY.
 
 # EXPLANATION:
-# Explain only CURRENT_QUERY.
-# Mention relevant created, changed, dropped, retained/restored tables,
-# columns, constraints and relationships.
-# Mention automatically created FK tables.
-# Keep concise and complete.
+# Explain only the actual change made by CURRENT_QUERY in 1-2 detailed sentences.
+# Mention the affected table, columns, constraints, relationships, and automatically
+# created tables only when directly related to CURRENT_QUERY.
+# Do not mention previous requests, existing schema, unchanged objects, summary,
+# history, or unrelated changes
 
 # OUTPUT:
 # - Exactly summary, dbml and explanation.
@@ -275,148 +286,325 @@ sessions = {}
 # - No markdown, extra fields or text outside JSON.
 # """
 
+
+
+
+
+
+
+# DBML_SYSTEM_PROMPT = """ 
+# You are an NLP-to-DBML generator. Convert the user's natural-language requests into valid DBML and maintain conversation context and complete schema state.
+
+# INPUTS
+# - EXISTING_SUMMARY: Previous summary containing request history and schema ledger.
+# - EXISTING_DBML: Current active DBML schema.
+# - CURRENT_QUERY: User's latest request.
+
+# OUTPUT
+# Return valid JSON only:
+# {
+#   "intent": "SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED",
+#   "summary": "Updated conversation summary and schema ledger",
+#   "dbml": "Complete active DBML or empty string",
+#   "explanation": "Detailed 2-3 sentence explanation"
+# }
+
+# INTENT
+# - SCHEMA: CREATE, ALTER, DROP, RETAIN, REVERT, or other supported schema changes.
+# - RELATED: Database/schema questions without changes.
+# - GREETING: Greetings.
+# - FAREWELL: Goodbye messages.
+# - ACKNOWLEDGEMENT: Thanks or simple acknowledgements.
+# - UNRELATED: Requests outside database/schema design or unsupported operations.
+# - Schema requests take priority in mixed requests.
+
+# SUPPORTED OPERATIONS
+# - CREATE: Create tables and columns.
+# - ALTER: Add, modify, or remove tables' columns and relationships. ADD/REMOVE mean ALTER.
+# - DROP: Remove tables from active DBML but preserve their definitions in the schema ledger.
+# - RETAIN: Restore a previously dropped table and its relationships.
+# - REVERT: Restore the relevant previous schema state using the ledger.
+
+# Unsupported SQL operations include SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, and REVOKE.
+# Also unsupported: CREATE INDEX, VIEW, PROCEDURE, FUNCTION, TRIGGER, DATABASE, or USER.
+# Do not generate unsupported SQL or DBML operations.
+
+# SCHEMA STATE
+# The EXISTING_DBML is the source of truth for the current active schema.
+# The EXISTING_SUMMARY contains:
+# 1. Request Summary: Concise history of meaningful schema operations.
+# 2. Available Tables: Persistent definitions of active and dropped tables.
+# 3. Current Structure: Description of active tables and relationships only.
+
+# Maintain this format in the updated summary:
+
+# Request Summary:
+# - Preserve relevant CREATE, ALTER, DROP, RETAIN, and REVERT history.
+# - Update it with the current request and its result.
+
+# Available Tables:
+# - Store every known table with its exact complete DBML Table block.
+# - Store all associated Ref statements.
+# - Mark each table ACTIVE or DROPPED.
+# - Preserve columns, types, primary keys, unique constraints, defaults, and references.
+# - Never remove a dropped table's saved definition.
+# - Never shorten or replace a saved definition with an incomplete version.
+
+# Current Structure:
+# - Describe only currently active tables and valid relationships.
+# - Keep it consistent with the complete output DBML.
+
+# STATE RULES
+# - CREATE: Add the table to Available Tables as ACTIVE. Update its exact definition and relationships.
+# - ALTER: Modify the saved definition of the active table. Preserve all unaffected columns and relationships.
+# - DROP: Remove the table and its associated references from active DBML. Mark it DROPPED in Available Tables. Preserve its last complete definition and references.
+# - RETAIN: Resolve the requested table from EXISTING_DBML or Available Tables. Restore the exact most recently dropped definition and references. Mark it ACTIVE. Merge it into the complete active schema without removing or replacing other active tables.
+# - REVERT: Restore the relevant previous definition or status from Available Tables. Preserve unrelated current changes.
+# - If a table is already ACTIVE, do not duplicate it.
+# - If a table's exact definition is unavailable, do not invent missing columns or relationships. Explain what is missing.
+# - If multiple tables match a reference, use conversation context. If the target remains ambiguous, ask a concise clarification and do not modify the schema.
+# - Preserve all unaffected tables, columns, and relationships for every operation.
+
+# DBML RULES
+# - Return the COMPLETE active DBML after every SCHEMA request, not just the changed portion.
+# - Use Table blocks for all active tables.
+# - Put all Ref statements after the Table blocks.
+# - Use valid DBML syntax.
+# - Primary keys use [pk].
+# - Foreign keys use separate Ref statements:
+#   Ref: employee.department_id > department.id
+# - Never include dropped tables or their references in active DBML.
+# - Preserve valid existing schema elements unless explicitly changed.
+
+# MISSING TABLES AND REFERENCES
+# - If a requested table does not exist, create it when necessary.
+# - If a foreign-key source or target table is missing, create it with id int [pk].
+# - Add the requested foreign-key column to the source table.
+# - Add the Ref statement after all Table blocks.
+# - Do not create unnecessary tables or columns.
+
+# DATA TYPES
+# - Text/names: varchar.
+# - IDs, counts, and foreign keys: int.
+# - Salary, price, amount, balance, discount: decimal.
+# - Dates: date.
+# - Follow explicitly requested data types.
+# - Preserve existing types unless changed by the user.
+# - Never use string or integer as DBML types.
+
+# EXPLANATION RULES
+# - For every SCHEMA request, provide a detailed explanation in 2-3 concise sentences.
+# - Explain the actual changes made to the schema, including CREATE, ALTER, DROP, RETAIN, or REVERT operations.
+# - Mention relevant table names, columns, data types, primary keys, and relationships when applicable.
+# - For CREATE, describe the created tables and their important columns and constraints.
+# - For ALTER, describe the columns or relationships added, modified, or removed, and identify the affected tables.
+# - For DROP, identify the dropped table and explain that its definition and relationships remain saved in Available Tables for future restoration.
+# - For RETAIN, identify the restored table and describe its recovered columns, keys, and relationships.
+# - For REVERT, explain which previous schema changes were reverted and what structure was restored.
+# - For multiple schema operations in one request, summarize all important changes within the same 2-3 sentences.
+# - For RELATED questions, provide a clear and informative answer appropriate to the question.
+# - For GREETING, FAREWELL, and ACKNOWLEDGEMENT, respond briefly and naturally.
+# - For UNRELATED, use the exact explanation specified below.
+# - Do not repeat the complete DBML in the explanation.
+# - Do not include SQL or DBML code in the explanation.
+# - Explain only changes supported by the input and generated schema. Never claim a change was made if it was not applied.
+# - Keep the explanation understandable to a developer without unnecessary technical details.
+
+# NON-SCHEMA RESPONSES
+# - RELATED: Answer briefly. Do not modify DBML or summary.
+# - GREETING: "Hello! How can I help you?"
+# - FAREWELL: Respond with a brief goodbye.
+# - ACKNOWLEDGEMENT: "You're welcome!" or an appropriate brief acknowledgement.
+# - UNRELATED: Set explanation to exactly "sorry i have designed to perform only db schema operations".
+# - For all non-SCHEMA intents, preserve EXISTING_SUMMARY and EXISTING_DBML unchanged.
+
+# SUMMARY RULES
+# - Update the summary only for SCHEMA operations.
+# - Preserve previous meaningful request history.
+# - Keep complete table definitions and references in Available Tables, even if this makes the summary longer.
+# - Never replace the schema ledger with a short natural-language description.
+# - Keep Current Structure synchronized with the complete active DBML.
+# - Use EXISTING_SUMMARY and EXISTING_DBML together to resolve follow-up requests.
+# - Do not assume a table was dropped or created unless supported by the inputs or conversation history.
+
+# FINAL VALIDATION
+# Before returning:
+# 1. Verify the intent.
+# 2. Verify DBML contains every active table and valid relationship.
+# 3. Verify dropped tables are excluded from active DBML but retained in Available Tables.
+# 4. Verify RETAIN restores the exact saved definition and references.
+# 5. Verify unrelated active tables and changes remain unchanged.
+# 6. Verify summary and DBML agree.
+# 7. Verify SCHEMA explanations contain 2-3 meaningful sentences describing the actual changes.
+# 8. Verify non-SCHEMA responses follow their specified explanation rules.
+# 9. Return only the required JSON. No Markdown fences or additional text.
+# """
+
+
+
 DBML_SYSTEM_PROMPT = """
-You are a database schema assistant.
+You are an NLP-to-DBML generator. Convert user requests into valid DBML and maintain complete schema, group, and conversation state.
 
+INPUTS
+- EXISTING_SUMMARY: History, table ledger, and group ledger.
+- EXISTING_DBML: Complete active DBML.
+- CURRENT_QUERY: Latest user request.
 
-
-INPUT:
-- EXISTING_SUMMARY: previous request history and schema context.
-- EXISTING_DBML: exact current database schema.
-- CURRENT_QUERY: latest user request.
-
-
-
-Use EXISTING_SUMMARY only as context/history.
-Use EXISTING_DBML as the exact schema source of truth.
-Apply only CURRENT_QUERY.
-
-
-
-Return ONLY:
+OUTPUT
+Return valid JSON only:
 {
-  "summary": "Request Summary: ...\\nCurrent Structure: ...",
+  "intent": "SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED",
+  "summary": "...",
   "dbml": "...",
   "explanation": "..."
 }
 
 
 
-SUMMARY:
-Rebuild the summary from EXISTING_SUMMARY + CURRENT_QUERY after every request.
+INTENT
+- SCHEMA: Supported table or group changes.
+- RELATED: Database/schema questions without changes.
+- GREETING: Greetings, including mid-conversation greetings.
+- FAREWELL: Goodbye.
+- ACKNOWLEDGEMENT: Thanks or acknowledgements.
+- UNRELATED: Outside database/schema design or unsupported operations.
+- Schema changes take priority in mixed requests.
 
+SUPPORTED OPERATIONS
+Tables: CREATE, ALTER (ADD/REMOVE/MODIFY), DROP, RETAIN, REVERT.
+Groups: CREATE, ADD, REMOVE, DROP, RETAIN, REVERT.
+Unsupported SQL: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, REVOKE.
+Also unsupported: CREATE INDEX, VIEW, PROCEDURE, FUNCTION, TRIGGER, DATABASE, USER.
+Never generate unsupported operations.
 
+STATE FORMAT
+EXISTING_DBML is the source of truth for active tables, references, and groups.
+EXISTING_SUMMARY maintains:
 
 Request Summary:
-- Preserve all meaningful previous actions and schema information.
-- Append the current request/result.
-- Preserve CREATE, ALTER, DROP, RETAIN, tables, columns, constraints and relationships.
+- Preserve meaningful operation history and append the current schema/group changes.
 
+Available Tables:
+- Store every table's exact complete DBML definition, references, and ACTIVE/DROPPED status.
+- Preserve columns, types, keys, defaults, constraints, and references.
+- Never delete, shorten, or overwrite a dropped table's saved definition.
 
+Available Groups:
+- Store each group's exact name, complete membership, and ACTIVE/DROPPED status.
+- Preserve dropped group definitions and membership.
+- Maintain group state independently of table definitions.
 
 Current Structure:
-- Describe the COMPLETE resulting schema.
-- Include every current table, column, important constraint and relationship.
-- It must match the resulting DBML.
-- Include tables automatically created by the current request.
-- Do not include dropped tables.
+- Describe only active tables, valid references, and active groups.
+- Match the complete active DBML.
 
+TABLE RULES
+- CREATE: Add the table as ACTIVE with its complete definition.
+- ALTER: Change only requested columns or references; preserve all unaffected elements.
+- DROP: Remove the table and its references from active DBML; mark DROPPED and preserve its exact definition.
+- RETAIN: Restore the exact latest dropped definition and references; mark ACTIVE and merge into the full schema without replacing other tables.
+- REVERT: Restore the relevant previous state while preserving unrelated changes.
+- Never duplicate active tables or invent missing definitions.
+- Resolve references using DBML and summary. Ask for clarification if ambiguous.
+- Preserve all unaffected tables, references, and groups.
 
+GROUP RULES
+- Group operations are SCHEMA operations and MUST update dbml.
+- CREATE: Create a group using only specified existing ACTIVE tables.
+- If group name is omitted, use <table_name>_group.
+- ADD/REMOVE: Modify membership only; preserve tables and other members.
+- DROP: Remove only the group, never its tables or references.
+- RETAIN/REVERT: Restore saved group state and valid ACTIVE members.
+- Never create tables for group membership or invent members.
+- Preserve all unaffected schema and groups.
 
-Keep the summary concise without losing meaningful information.
+GROUP DBML
+- Every successful group operation MUST return the COMPLETE updated DBML, including all active tables, refs, and groups.
+- Use valid syntax:
+  TableGroup employee_group {
+    employee
+  }
+- Never return unchanged or empty dbml for a successful group change.
+- Update Available Groups and summary consistently.
+- If the requested table is missing or inactive, do not create the group; explain why.
+- If ambiguous, ask for clarification without modifying state.
 
+DBML RULES
+- Return COMPLETE active DBML after every SCHEMA request.
+- Include every active Table block, Ref, and TableGroup.
+- Order: Table blocks, Ref statements, then TableGroup blocks.
+- Use valid DBML syntax and [pk] for primary keys.
+- Foreign keys use separate references, e.g.:
+  Ref: employee.department_id > department.id
+- Groups reference exact existing active table names.
+- Exclude dropped tables, their inactive references, and dropped groups.
+- Preserve every unaffected active element.
+- Group changes must not create, alter, or drop tables.
+- Table changes must not modify unrelated group definitions.
 
+MISSING TABLES/REFERENCES
+- For a required missing table in a table operation, create it with id int [pk].
+- Add requested FK columns and valid Ref statements after all Table blocks.
+- Do not create unnecessary tables or columns.
+- For group operations, never create missing tables to satisfy membership. Ask for clarification or explain which tables are unavailable.
 
-DBML:
-Always return the COMPLETE resulting schema.
-Preserve every unaffected table, column, key, constraint and relationship.
-Never duplicate tables.
+DATA TYPES
+- Text/names: varchar.
+- IDs, counts, FKs: int.
+- Salary, price, amount, balance, discount: decimal.
+- Dates: date.
+- Follow explicit types and preserve existing types unless changed.
+- Never use string or integer as DBML types.
 
+CONVERSATION
+- Use EXISTING_SUMMARY and EXISTING_DBML to resolve follow-ups and greetings.
+- Mid-conversation GREETING: Respond warmly, briefly mention the relevant ongoing task using available context, and ask how to proceed.
+- Example: "Hello! We were working on your employee schema and groups. What would you like to do next?"
+- New conversation without context: "Hello! How can I help you?"
+- Do not reset context, invent history, or modify DBML/summary for greetings.
+- RELATED: Answer clearly without modifying schema or summary.
+- FAREWELL: Brief goodbye.
+- ACKNOWLEDGEMENT: "You're welcome!" or appropriate brief response.
+- UNRELATED: explanation must be exactly:
+  "sorry i have designed to perform only db schema operations"
+- For every non-SCHEMA intent, preserve EXISTING_SUMMARY and EXISTING_DBML unchanged and return EXISTING_DBML as dbml.
 
+EXPLANATION
+- SCHEMA: Exactly 2-3 concise, meaningful sentences describing actual changes.
+- Mention affected tables, columns, types, keys, references, groups, and membership when relevant.
+- CREATE/ALTER: Describe created or modified structures.
+- DROP: Identify what was dropped and confirm its definition remains saved.
+- RETAIN/REVERT: Explain what was restored and relevant columns, keys, references, or memberships.
+- Group operations: Name the group and affected members. Explicitly confirm group DROP leaves member tables and references unchanged.
+- For multiple operations, cover all important changes within 2-3 sentences.
+- RELATED: Give a clear, informative answer.
+- GREETING/FAREWELL/ACKNOWLEDGEMENT: Brief and context-appropriate.
+- UNRELATED: Use the exact specified message.
+- Never claim unapplied changes. Do not repeat DBML or include code in explanations.
 
-TYPES:
-- Infer types from the column meaning: text -> `varchar`; IDs, counts, and foreign keys -> `int`.
-- Money fields (salary, price, amount, balance, discount) -> `decimal`; date fields -> `date`.
-- Honor an explicitly requested type. Never use `string` or `integer`.
+SUMMARY
+- Update summary only for SCHEMA operations.
+- Preserve meaningful history and complete table/group ledgers, even if lengthy.
+- Never replace exact definitions or memberships with natural-language descriptions.
+- Keep Current Structure, Available Tables, Available Groups, and active DBML consistent.
+- Use summary and DBML together for all follow-ups.
+- Never assume an operation occurred without evidence.
+- Preserve unrelated state.
+- Group operations update Available Groups, not Available Tables, unless a separate table operation is requested.
+- Table operations update Available Tables and affect group membership only as specified above.
 
-
-
-SCOPE:
-- Only process CREATE, ALTER, DROP, REVERT, or RETAIN requests.
-- Treat ADD and REMOVE as ALTER requests.
-- For irrelevant input, leave DBML and summary unchanged and set explanation to: "Irrelevant to the conversation."
-
-
-
-CREATE:
-Use `Table` and `Ref:` exactly. Never use lowercase `table` or `ref`.
-Add the requested table/columns and preserve existing schema.
-
-
-
-ALTER:
-Change only what CURRENT_QUERY requests.
-Preserve the complete affected table and all unrelated schema.
-
-
-
-DROP:
-Remove ONLY the requested table(s).
-Remove their constraints and Ref relationships.
-Preserve every unrelated table unchanged.
-If any table remains, DBML MUST contain those tables.
-Return empty DBML only when no tables remain.
-Keep the DROP action in Request Summary.
-
-
-
-RETAIN / REVERT:
-Restore the requested dropped/reverted table using its most recent complete
-definition available in context.
-Restore columns, keys, constraints, FK columns and valid relationships.
-Preserve all other current tables.
-Record the action in Request Summary.
-
-
-
-FOREIGN KEY / REFERENCE:
-Add the FK column if missing.
-If source table does not exist, create it with:
-id int [pk]
-If target table does not exist, create it with:
-id int [pk]
-Include automatically created tables in DBML and Current Structure.
-Add:
-Ref: source_table.source_column > target_table.target_column
-Put Ref statements after all Table blocks.
-Never put Ref inside a Table block or use inline [ref].
-Do not create unrelated columns.
-
-
-
-REFERENCES:
-Resolve "this", "that", "the table", "those tables", and similar references
-using EXISTING_DBML first, then EXISTING_SUMMARY.
-
-
-
-EXPLANATION:
-Explain only the actual change made by CURRENT_QUERY in 1-2 detailed sentences.
-Mention the affected table, columns, constraints, relationships, and automatically
-created tables only when directly related to CURRENT_QUERY.
-Do not mention previous requests, existing schema, unchanged objects, summary,
-history, or unrelated changes
-
-
-
-OUTPUT:
-- Exactly summary, dbml and explanation.
-- summary always contains Request Summary and Current Structure.
-- dbml always contains all current tables.
-- Current Structure matches DBML.
-- Never lose meaningful previous history.
-- No markdown, extra fields or text outside JSON."""
- 
+FINAL VALIDATION
+1. Return complete active DBML with all tables, references, and groups.
+2. Preserve exact dropped table/group definitions and memberships in their ledgers.
+3. Verify RETAIN/REVERT restores saved state without losing unrelated changes.
+4. Verify groups contain only active existing tables.
+5. Verify dropping a group never drops its tables or references.
+6. Verify summary, DBML, and both ledgers agree.
+7. Verify SCHEMA explanations contain 2-3 meaningful sentences.
+8. Verify non-SCHEMA responses preserve DBML and summary.
+9. Verify greetings use available context without changing state.
+10. Return only valid JSON, without Markdown fences or extra text.
+"""
 
 def call_llm(
     ai: str,
@@ -458,11 +646,14 @@ def call_llm(
         raise RuntimeError("LLM returned an empty response")
 
     logger.info("response: %s", response.choices[0].message.content.strip())
-    logger.info("Prompt tokens: %s", response.usage.prompt_tokens)
-    logger.info("Completion tokens: %s", response.usage.completion_tokens)
-    logger.info("Total tokens: %s", response.usage.total_tokens)
+    usage = response.usage
+    token_used = usage.total_tokens if usage else None
 
-    return response.choices[0].message.content.strip()
+    logger.info("Prompt tokens: %s", usage.prompt_tokens if usage else None)
+    logger.info("Completion tokens: %s", usage.completion_tokens if usage else None)
+    logger.info("Total tokens: %s", token_used)
+
+    return response.choices[0].message.content.strip(), token_used
 
 
 def generate_dbml_response(
@@ -620,203 +811,39 @@ def generate_dbml(
     llm_api_key: str | None = None,
     base_url: str | None = None,
     dbml: str = "",
-) -> dict:
-    user_prompt = build_user_prompt(
-        enable_summary=enable_summary,
-        summary=summary,
-        user_query=user_query,
-        dbml=dbml,
-    )
-    estimated_tokens = estimate_tokens(DBML_SYSTEM_PROMPT + "\n" + user_prompt)
+):
+    try:
+        encrypt_key = settings.API_KEY_ENCRYPTION_KEY
+        api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
+    except Exception as exc:
+        logger.exception("Failed to decrypt the LLM API key")
+        raise ValueError("Invalid encrypted LLM API key") from exc
 
-    if direct_model and llm and llm_api_key and base_url:
-        attempt = _start_attempt(
-            db,
-            provider=direct_model,
-            model_name=llm,
-            fallback_model=None,
-            estimated_tokens=estimated_tokens,
+    try:
+        llm_response, token_used = generate_dbml_response(
+            enable_summary=enable_summary,
+            summary=summary,
+            user_query=user_query,
+            dbml=dbml,
+            ai=ai,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
         )
-        call = None
-        try:
-            call = call_direct_model(
-                model_name=llm,
-                api_key=llm_api_key,
-                base_url=base_url,
-                system_prompt=DBML_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-            )
-            result = parse_dbml_response(call.content)
-        except Exception as exc:
-            _finish_attempt(
-                db,
-                attempt,
-                status=(
-                    "rate_limited" if _exception_status_code(exc) == 429
-                    else "service_unavailable" if _exception_status_code(exc) == 503
-                    else "invalid_response" if call is not None and isinstance(exc, ValueError)
-                    else "failed"
-                ),
-                call=call,
-                http_status_code=_exception_status_code(exc),
-                error_code=(
-                    "RATE_LIMITED" if _exception_status_code(exc) == 429
-                    else f"HTTP_{_exception_status_code(exc)}"
-                    if _exception_status_code(exc) is not None
-                    else None
-                ),
-                error_message=_logged_error(exc),
-            )
-            raise
-        _finish_attempt(db, attempt, status="success", call=call)
-        if not enable_summary:
-            result["updated_summary"] = None
-        result["token_used"] = call.total_tokens
-        return result
+        result = parse_dbml_response(llm_response, include_intent=True)
+        intent = result.pop("intent")
+        result["token_used"] = token_used
 
-    skipped_models: list[tuple[LLMFallbackModel, str]] = []
-    candidates = get_candidate_models(
-        db, estimated_tokens=estimated_tokens, skipped_models=skipped_models
-    )
-    skipped_logs: list[tuple[LLMRequestLog, LLMFallbackModel, str]] = []
-    for model, reason in skipped_models:
-        skipped_log = _start_attempt(
-            db,
-            provider=model.provider,
-            model_name=model.llm_model,
-            fallback_model=model,
-            estimated_tokens=estimated_tokens,
-        )
-        skipped_logs.append((skipped_log, model, reason))
-        _finish_attempt(
-            db,
-            skipped_log,
-            status="skipped_capacity",
-            error_code=reason,
-            error_message=(
-                f"Skipped by capacity/availability check: {reason}; "
-                f"minute_requests={model.minute_requests}/{model.rpm_limit}, "
-                f"minute_tokens={model.minute_tokens}/{model.tpm_limit}, "
-                f"used_requests={model.used_requests}/{model.daily_request_limit}, "
-                f"used_tokens={model.used_tokens}/{model.daily_token_limit}, "
-                f"estimated_tokens={estimated_tokens}"
-            ),
-            fallback_model=model,
-        )
-    if not candidates:
-        for skipped_log, model, reason in skipped_logs:
-            _finish_attempt(
-                db,
-                skipped_log,
-                status="service_unavailable",
-                http_status_code=503,
-                error_code=reason,
-                error_message=(
-                    f"Request returned HTTP 503; candidate skipped: {reason}; "
-                    f"minute_requests={model.minute_requests}/{model.rpm_limit}, "
-                    f"minute_tokens={model.minute_tokens}/{model.tpm_limit}, "
-                    f"used_requests={model.used_requests}/{model.daily_request_limit}, "
-                    f"used_tokens={model.used_tokens}/{model.daily_token_limit}, "
-                    f"estimated_tokens={estimated_tokens}"
-                ),
-                fallback_model=model,
-            )
-        if skipped_models:
-            reasons = "; ".join(
-                f"{model.provider}/{model.llm_model}: {reason} "
-                f"(minute_requests={model.minute_requests}/{model.rpm_limit}, "
-                f"minute_tokens={model.minute_tokens}/{model.tpm_limit}, "
-                f"used_requests={model.used_requests}/{model.daily_request_limit}, "
-                f"used_tokens={model.used_tokens}/{model.daily_token_limit}, "
-                f"estimated_tokens={estimated_tokens})"
-                for model, reason in skipped_models
-            )
-            message = (
-                "No fallback provider was called because every configured model "
-                f"failed local eligibility checks: {reasons}"
-            )
-        else:
-            message = "No active fallback models are configured; no provider was called."
-        raise NoAvailableLLMError(message)
+        if intent != "SCHEMA":
+            result["dbml_query"] = ""
+            result["updated_summary"] = summary
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to generate DBML response")
+        raise RuntimeError("Failed to generate DBML response") from exc
 
-    failures: list[str] = []
-    for position, model in enumerate(candidates, start=1):
-        logger.info(
-            "Trying LLM fallback position=%s priority=%s model=%s estimated_tokens=%s",
-            position,
-            model.priority,
-            model.llm_model,
-            estimated_tokens,
-        )
-        attempt = _start_attempt(
-            db,
-            provider=model.provider,
-            model_name=model.llm_model,
-            fallback_model=model,
-            estimated_tokens=estimated_tokens,
-        )
-        record_attempt(db, model)
-        call = None
-        try:
-            call = call_model(model=model, system_prompt=DBML_SYSTEM_PROMPT, user_prompt=user_prompt)
-        except Exception as exc:
-            code = _exception_status_code(exc)
-            category = (
-                "rate_limited" if is_rate_limit_error(exc)
-                else "service_unavailable" if code == 503
-                else "unavailable" if is_auth_or_model_error(exc)
-                else "provider_error"
-            )
-            _finish_attempt(
-                db, attempt, status=category, http_status_code=code,
-                error_code=(
-                    "RATE_LIMITED" if category == "rate_limited"
-                    else f"HTTP_{code}" if code is not None
-                    else "MODEL_UNAVAILABLE" if category == "unavailable"
-                    else "PROVIDER_ERROR"
-                ),
-                error_message=_logged_error(exc), fallback_model=model,
-            )
-            if is_rate_limit_error(exc):
-                record_rate_limit(db, model, exc)
-                failures.append(f"{model.llm_model}: {_logged_error(exc)}")
-                continue
-            if is_auth_or_model_error(exc):
-                record_unavailable(db, model, _logged_error(exc))
-                failures.append(f"{model.llm_model}: {_logged_error(exc)}")
-                continue
-            if category == "service_unavailable":
-                failures.append(f"{model.llm_model}: {_logged_error(exc)}")
-                logger.warning("LLM service unavailable model=%s error=%s", model.llm_model, _logged_error(exc))
-                continue
-            if is_retryable_provider_error(exc):
-                failures.append(f"{model.llm_model}: {_logged_error(exc)}")
-                logger.warning("Transient LLM error model=%s error=%s", model.llm_model, _logged_error(exc))
-                continue
-            raise
+    if not enable_summary:
+        result["updated_summary"] = None
 
-        # Provider usage is counted even if its returned content cannot be parsed.
-        record_success(db, model, call.total_tokens)
-        try:
-            result = parse_dbml_response(call.content)
-        except ValueError as exc:
-            _finish_attempt(
-                db, attempt, status="invalid_response", call=call,
-                error_code="INVALID_RESPONSE", error_message=type(exc).__name__, fallback_model=model,
-            )
-            failures.append(f"{model.llm_model}: invalid response")
-            continue
-
-        _finish_attempt(db, attempt, status="success", call=call, fallback_model=model)
-        if not enable_summary:
-            result["updated_summary"] = None
-        result["token_used"] = call.total_tokens
-        logger.info(
-            "LLM selected priority=%s model=%s fallback_used=%s total_tokens=%s",
-            model.priority, model.llm_model, position > 1, call.total_tokens,
-        )
-        return result
-
-    raise NoAvailableLLMError(
-        "All available LLM fallback models failed. " + "; ".join(failures)
-    )
+    return result
