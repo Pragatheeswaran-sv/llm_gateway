@@ -1,3 +1,21 @@
+from src.conversation.models import LLMFallbackModel, LLMRequestLog
+from src.conversation.fallback import (
+    DEFAULT_TEMPERATURE,
+    NoAvailableLLMError,
+    ProviderRequestError,
+    call_model,
+    call_direct_model,
+    estimate_tokens,
+    get_candidate_models,
+    is_auth_or_model_error,
+    is_rate_limit_error,
+    is_retryable_provider_error,
+    _provider_error_message,
+    record_attempt,
+    record_rate_limit,
+    record_success,
+    record_unavailable,
+)
 import logging
 from uuid import UUID
 
@@ -441,6 +459,8 @@ Return valid JSON only:
   "explanation": "..."
 }
 
+
+
 INTENT
 - SCHEMA: Supported table or group changes.
 - RELATED: Database/schema questions without changes.
@@ -594,7 +614,7 @@ def call_llm(
     system_prompt: str,
     user_prompt: str,
 ):
-    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi",):
+    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi","freellmapi"):
         raise ValueError(f"Unsupported AI provider: {ai}")
 
     try:
@@ -605,7 +625,7 @@ def call_llm(
 
         response = client.chat.completions.create(
             model=model,
-            temperature=0.1,
+            temperature=DEFAULT_TEMPERATURE,
             reasoning_effort='medium',
             messages=[
                 {
@@ -632,8 +652,10 @@ def call_llm(
     logger.info("Prompt tokens: %s", usage.prompt_tokens if usage else None)
     logger.info("Completion tokens: %s", usage.completion_tokens if usage else None)
     logger.info("Total tokens: %s", token_used)
-
+    logger.info("LLM request completed successfully for provider %s", ai)
+    logger.info("response: %s", response.choices[0].message.content.strip())
     return response.choices[0].message.content.strip(), token_used
+
 
 
 def generate_dbml_response(
@@ -689,14 +711,106 @@ def validate_access_token(db: Session, token: str) -> RegisterApplication:
     return app
 
 
+
+def build_user_prompt(enable_summary: bool, summary: str, user_query: str, dbml: str = "") -> str:
+    existing_summary = (summary or "").strip() if enable_summary else ""
+    if not existing_summary:
+        existing_summary = "NO PREVIOUS SUMMARY"
+
+    return (
+        f"EXISTING_SUMMARY:\n{existing_summary}\n\n"
+        f"EXISTING_DBML:\n{dbml or 'No existing DBML.'}\n\n"
+        f"CURRENT_QUERY:\n{user_query.strip()}\n\n"
+        f"SUMMARY_ENABLED:\n{enable_summary}"
+    )
+
+
+def _start_attempt(
+    db: Session,
+    *,
+    provider: str,
+    model_name: str,
+    fallback_model: LLMFallbackModel | None,
+    estimated_tokens: int | None,
+) -> LLMRequestLog:
+    row = LLMRequestLog(
+        llm_fallback_model_id=fallback_model.id if fallback_model else None,
+        provider=provider,
+        model_name=model_name,
+        status="started",
+        temperature=DEFAULT_TEMPERATURE,
+        estimated_tokens=estimated_tokens,
+        used_tokens=fallback_model.used_tokens if fallback_model else None,
+        used_requests=fallback_model.used_requests if fallback_model else None,
+        minute_requests=fallback_model.minute_requests if fallback_model else None,
+        minute_tokens=fallback_model.minute_tokens if fallback_model else None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _finish_attempt(
+    db: Session,
+    row: LLMRequestLog,
+    *,
+    status: str,
+    call=None,
+    http_status_code: int | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    fallback_model: LLMFallbackModel | None = None,
+) -> None:
+    from datetime import datetime, timezone
+
+    row.status = status
+    row.http_status_code = http_status_code
+    row.error_code = error_code
+    row.error_message = error_message
+    row.completed_at = datetime.now(timezone.utc)
+    row.prompt_tokens = call.prompt_tokens if call else None
+    row.completion_tokens = call.completion_tokens if call else None
+    row.total_tokens = call.total_tokens if call else None
+    if fallback_model is not None:
+        row.used_tokens = fallback_model.used_tokens
+        row.used_requests = fallback_model.used_requests
+        row.minute_requests = fallback_model.minute_requests
+        row.minute_tokens = fallback_model.minute_tokens
+    db.commit()
+
+
+def _exception_status_code(exc: Exception) -> int | None:
+    from src.conversation.fallback import _status_code
+
+    status_code = _status_code(exc)
+    if status_code is not None:
+        return status_code
+    import re
+
+    match = re.search(r"Provider HTTP (\d{3})", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _logged_error(exc: Exception) -> str:
+    code = _exception_status_code(exc)
+    suffix = f" (HTTP {code})" if code is not None else ""
+    detail = str(exc) if isinstance(exc, ProviderRequestError) else _provider_error_message(exc)
+    detail = str(detail).strip()
+    if len(detail) > 1000:
+        detail = detail[:997] + "..."
+    return f"{type(exc).__name__}{suffix}: {detail}" if detail else f"{type(exc).__name__}{suffix}"
+
+
 def generate_dbml(
+    db: Session,
     user_query: str,
-    ai: str,
-    model: str,
-    encrypted_api_key: str,
-    base_url: str,
     enable_summary: bool = False,
     summary: str = "",
+    model: str | None = None,
+    llm: str | None = None,
+    llm_api_key: str | None = None,
+    base_url: str | None = None,
     dbml: str = "",
 ):
     try:
@@ -707,12 +821,21 @@ def generate_dbml(
         raise ValueError("Invalid encrypted LLM API key") from exc
 
     try:
+        if model is None:
+            raise ValueError("Model is required")
+        if llm is None:
+            raise ValueError("LLM provider is required")
+        if base_url is None:
+            raise ValueError("Base URL is required")
+        if llm_api_key is None:
+            raise ValueError("LLM API key is required")
+
         llm_response, token_used = generate_dbml_response(
             enable_summary=enable_summary,
             summary=summary,
             user_query=user_query,
             dbml=dbml,
-            ai=ai,
+            ai=llm,
             model=model,
             api_key=api_key,
             base_url=base_url,

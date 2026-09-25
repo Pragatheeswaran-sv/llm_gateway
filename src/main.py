@@ -48,6 +48,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "status_code": exc.status_code,
             "error": str(exc.detail),
         },
+        headers=exc.headers,
     )
 
 
@@ -66,7 +67,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/health")
 def health():
     return {
-        "msg": "LLM Gateway is running",
-        "status": status.HTTP_200_OK,
+        "message": "LLM Gateway is running",
+        "status_code": status.HTTP_200_OK,
         "data": {},
     }
