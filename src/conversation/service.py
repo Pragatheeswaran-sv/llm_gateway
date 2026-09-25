@@ -807,53 +807,181 @@ def generate_dbml(
     user_query: str,
     enable_summary: bool = False,
     summary: str = "",
-    model: str | None = None,
+    direct_model: str | None = None,
     llm: str | None = None,
     llm_api_key: str | None = None,
     base_url: str | None = None,
     dbml: str = "",
-):
+) -> dict:
     try:
         encrypt_key = settings.API_KEY_ENCRYPTION_KEY
+        encrypted_api_key = llm_api_key 
         api_key = decrypt_api_key(encrypted_api_key, encrypt_key)
     except Exception as exc:
         logger.exception("Failed to decrypt the LLM API key")
-        raise ValueError("Invalid encrypted LLM API key") from exc
+        raise ValueError("Invalid API key format") from exc
+    user_prompt = build_user_prompt(
+        enable_summary=enable_summary,
+        summary=summary,
+        user_query=user_query,
+        dbml=dbml,
+    )
+    estimated_tokens = estimate_tokens(DBML_SYSTEM_PROMPT + "\n" + user_prompt)
 
-    try:
-        if model is None:
-            raise ValueError("Model is required")
-        if llm is None:
-            raise ValueError("LLM provider is required")
-        if base_url is None:
-            raise ValueError("Base URL is required")
-        if llm_api_key is None:
-            raise ValueError("LLM API key is required")
-
-        llm_response, token_used = generate_dbml_response(
-            enable_summary=enable_summary,
-            summary=summary,
-            user_query=user_query,
-            dbml=dbml,
-            ai=llm,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
+    if direct_model and llm and llm_api_key and base_url:
+        attempt = _start_attempt(
+            db,
+            provider=direct_model,
+            model_name=llm,
+            fallback_model=None,
+            estimated_tokens=estimated_tokens,
         )
-        result = parse_dbml_response(llm_response, include_intent=True)
-        intent = result.pop("intent")
-        result["token_used"] = token_used
+        call = None
+        try:
+            call = call_direct_model(
+                model_name=llm,
+                api_key=llm_api_key,
+                base_url=base_url,
+                system_prompt=DBML_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+            result = parse_dbml_response(call.content, include_intent=True)
+            intent = result.pop("intent")
 
-        if intent != "SCHEMA":
-            result["dbml_query"] = ""
-            result["updated_summary"] = summary
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.exception("Failed to generate DBML response")
-        raise RuntimeError("Failed to generate DBML response") from exc
+            if intent != "SCHEMA":
+                result["dbml_query"] = ""
+                result["updated_summary"] = summary
+        except Exception as exc:
+            _finish_attempt(
+                db,
+                attempt,
+                status=(
+                    "rate_limited" if _exception_status_code(exc) == 429
+                    else "service_unavailable" if _exception_status_code(exc) == 503
+                    else "invalid_response" if call is not None and isinstance(exc, ValueError)
+                    else "failed"
+                ),
+                call=call,
+                http_status_code=_exception_status_code(exc),
+                error_code=(
+                    "RATE_LIMITED" if _exception_status_code(exc) == 429
+                    else f"HTTP_{_exception_status_code(exc)}"
+                    if _exception_status_code(exc) is not None
+                    else None
+                ),
+                error_message=_logged_error(exc),
+            )
+            raise
+        _finish_attempt(db, attempt, status="success", call=call)
+        if not enable_summary:
+            result["updated_summary"] = None
+        result["token_used"] = call.total_tokens
+        return result
 
-    if not enable_summary:
-        result["updated_summary"] = None
+    skipped_models: list[tuple[LLMFallbackModel, str]] = []
+    candidates = get_candidate_models(
+        db, estimated_tokens=estimated_tokens, skipped_models=skipped_models
+    )
+    skipped_logs: list[tuple[LLMRequestLog, LLMFallbackModel, str]] = []
+    for model, reason in skipped_models:
+        skipped_log = _start_attempt(
+            db,
+            provider=model.provider,
+            model_name=model.llm_model,
+            fallback_model=model,
+            estimated_tokens=estimated_tokens,
+        )
+        skipped_logs.append((skipped_log, model, reason))
+        _finish_attempt(
+            db,
+            skipped_log,
+            status="skipped_capacity",
+            error_code=reason,
+            error_message=(
+                f"Skipped by capacity/availability check: {reason}; "
+                f"minute_requests={model.minute_requests}/{model.rpm_limit}, "
+                f"minute_tokens={model.minute_tokens}/{model.tpm_limit}, "
+                f"used_requests={model.used_requests}/{model.daily_request_limit}, "
+                f"used_tokens={model.used_tokens}/{model.daily_token_limit}, "
+                f"estimated_tokens={estimated_tokens}"
+            ),
+            fallback_model=model,
+        )
+    if not candidates:
+        for skipped_log, model, reason in skipped_logs:
+            _finish_attempt(
+                db,
+                skipped_log,
+                status="service_unavailable",
+                http_status_code=503,
+                error_code=reason,
+                error_message=(
+                    f"Request returned HTTP 503; candidate skipped: {reason}; "
+                    f"minute_requests={model.minute_requests}/{model.rpm_limit}, "
+                    f"minute_tokens={model.minute_tokens}/{model.tpm_limit}, "
+                    f"used_requests={model.used_requests}/{model.daily_request_limit}, "
+                    f"used_tokens={model.used_tokens}/{model.daily_token_limit}, "
+                    f"estimated_tokens={estimated_tokens}"
+                ),
+                fallback_model=model,
+            )
+        raise NoAvailableLLMError("No active fallback models are available.")
 
-    return result
+    failures: list[str] = []
+    for position, model in enumerate(candidates, start=1):
+        attempt = _start_attempt(
+            db,
+            provider=model.provider,
+            model_name=model.llm_model,
+            fallback_model=model,
+            estimated_tokens=estimated_tokens,
+        )
+        record_attempt(db, model)
+        call = None
+        try:
+            call = call_model(model=model, system_prompt=DBML_SYSTEM_PROMPT, user_prompt=user_prompt)
+        except Exception as exc:
+            logger.exception("Failed to generate DBML response")
+            raise RuntimeError("Failed to generate DBML response") from exc
+            code = _exception_status_code(exc)
+            category = (
+                "rate_limited" if is_rate_limit_error(exc)
+                else "service_unavailable" if code == 503
+                else "unavailable" if is_auth_or_model_error(exc)
+                else "provider_error"
+            )
+            _finish_attempt(
+                db, attempt, status=category, http_status_code=code,
+                error_code=(
+                    "RATE_LIMITED" if category == "rate_limited"
+                    else f"HTTP_{code}" if code is not None
+                    else "MODEL_UNAVAILABLE" if category == "unavailable"
+                    else "PROVIDER_ERROR"
+                ),
+                error_message=_logged_error(exc), fallback_model=model,
+            )
+            if is_rate_limit_error(exc) or is_auth_or_model_error(exc) or code == 503 or is_retryable_provider_error(exc):
+                failures.append(f"{model.llm_model}: {_logged_error(exc)}")
+                continue
+            raise
+
+        record_success(db, model, call.total_tokens)
+        try:
+            result = parse_dbml_response(call.content)
+        except ValueError as exc:
+            _finish_attempt(
+                db, attempt, status="invalid_response", call=call,
+                error_code="INVALID_RESPONSE", error_message=type(exc).__name__, fallback_model=model,
+            )
+            failures.append(f"{model.llm_model}: invalid response")
+            continue
+
+        _finish_attempt(db, attempt, status="success", call=call, fallback_model=model)
+        if not enable_summary:
+            result["updated_summary"] = None
+        result["token_used"] = call.total_tokens
+        return result
+
+    raise NoAvailableLLMError(
+        "All available LLM fallback models failed. " + "; ".join(failures)
+    )
