@@ -1,6 +1,8 @@
 from src.conversation.models import LLMFallbackModel, LLMRequestLog
+from src.conversation.schemas import SUPPORTED_PROVIDERS
 from src.conversation.fallback import (
     DEFAULT_TEMPERATURE,
+    InvalidDirectAPIKeyError,
     NoAvailableLLMError,
     ProviderRequestError,
     call_model,
@@ -23,7 +25,7 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from src.register_application.models import RegisterApplication
-from src.utils.helper import decode_access_token, parse_dbml_response
+from src.utils.helper import decode_access_token, decrypt_api_key, parse_dbml_response
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -821,23 +823,82 @@ def generate_dbml(
     )
     estimated_tokens = estimate_tokens(DBML_SYSTEM_PROMPT + "\n" + user_prompt)
 
-    if direct_model and llm and llm_api_key and base_url:
+    # Any direct fields select direct mode. Fill omitted configuration from the
+    # active fallback model so clients can retain their saved provider settings
+    # without sending an API key on every request.
+    direct_values_supplied = any(
+        value and value.strip()
+        for value in (direct_model, llm, llm_api_key, base_url)
+    )
+    if direct_values_supplied:
+        defaults = db.query(LLMFallbackModel).filter(
+            LLMFallbackModel.is_active.is_(True),
+            LLMFallbackModel.status == "ACTIVE",
+        ).order_by(LLMFallbackModel.priority.asc().nullslast(), LLMFallbackModel.id.asc()).first()
+
+        provider = direct_model or (defaults.provider if defaults else None)
+        model_name = llm or (defaults.llm_model if defaults else None)
+        resolved_base_url = base_url or (defaults.api_base_url if defaults else None)
+        if llm_api_key:
+            resolved_api_key = llm_api_key
+        elif defaults is not None:
+            if not settings.API_KEY_ENCRYPTION_KEY:
+                raise ValueError("API_KEY_ENCRYPTION_KEY is not configured")
+            try:
+                resolved_api_key = decrypt_api_key(
+                    defaults.api_key, settings.API_KEY_ENCRYPTION_KEY
+                )
+            except Exception as exc:
+                logger.exception("Failed to decrypt the configured LLM API key")
+                raise ValueError("Invalid configured API key format") from exc
+
+        if not provider or not model_name or not resolved_api_key or not resolved_base_url:
+            raise NoAvailableLLMError(
+                "Direct LLM settings are incomplete and no active configured model can fill the missing values."
+            )
+        if provider.lower() not in SUPPORTED_PROVIDERS:
+            raise ValueError(f"Unsupported AI provider: {provider}")
+
         attempt = _start_attempt(
             db,
-            provider=direct_model,
-            model_name=llm,
+            provider=provider,
+            model_name=model_name,
             fallback_model=None,
             estimated_tokens=estimated_tokens,
         )
         call = None
         try:
             call = call_direct_model(
-                model_name=llm,
-                api_key=llm_api_key,
-                base_url=base_url,
+                model_name=model_name,
+                api_key=resolved_api_key,
+                base_url=resolved_base_url,
                 system_prompt=DBML_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
             )
+        except InvalidDirectAPIKeyError as exc:
+            _finish_attempt(
+                db,
+                attempt,
+                status="failed",
+                error_code="INVALID_API_KEY",
+                error_message=str(exc),
+            )
+            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            _finish_attempt(
+                db,
+                attempt,
+                status="failed",
+                http_status_code=_exception_status_code(exc),
+                error_code=(
+                    f"HTTP_{_exception_status_code(exc)}"
+                    if _exception_status_code(exc) is not None
+                    else None
+                ),
+                error_message=_logged_error(exc),
+            )
+            raise
+        try:
             result = parse_dbml_response(call.content, include_intent=True)
             intent = result.pop("intent")
 
