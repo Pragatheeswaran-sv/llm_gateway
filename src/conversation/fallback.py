@@ -208,7 +208,7 @@ def _call_openai_model(
     prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
     total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
-
+    logger.info('content: %s', content)
     logger.info(
         "LLM success model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
         model_name,
