@@ -68,6 +68,12 @@ class LLMRequestLog(Base):
     __tablename__ = "llm_request_logs"
 
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    request_id = Column(Uuid(as_uuid=True), nullable=True, index=True)
+    user_prompt = Column(Text, nullable=True)
+    dbml_query = Column(Text, nullable=True)
+    summary_enabled = Column(Boolean, nullable=True)
+    summary = Column(Text, nullable=True)
+    duration_ms = Column(BigInteger, nullable=True)
     llm_fallback_model_id = Column(
         Uuid(as_uuid=True),
         ForeignKey("llm_fallback_models.id", ondelete="SET NULL"),
