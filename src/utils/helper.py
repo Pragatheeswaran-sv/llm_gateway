@@ -9,10 +9,11 @@ from datetime import datetime, timedelta, timezone
 import os
 import base64
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import logging
 
 from src.config import settings
 
-
+logger = logging.getLogger(__name__)
 class AccessTokenError(ValueError):
     pass
 
@@ -74,38 +75,118 @@ VALID_LLM_INTENTS = {
     "UNRELATED",
 }
 
+CODE_FENCE_PATTERN = re.compile(
+    r"```[a-zA-Z0-9_+-]*\s*(.*?)```", flags=re.DOTALL
+)
+
+
+def strip_code_fence(text: str) -> str:
+    """Return the fenced body when the model wrapped its answer in markdown."""
+    match = CODE_FENCE_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def extract_json_object(text: str) -> str | None:
+    """Slice the outermost brace-balanced object, ignoring braces inside strings."""
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    return None
+
+
+def coerce_llm_field(value) -> str:
+    """Render any JSON value as text instead of rejecting the whole response."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def unescape_llm_text(value: str) -> str:
+    """Turn escape sequences that survived JSON decoding into real characters."""
+    if "\\" not in value:
+        return value
+    return (
+        value.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+    )
+
+
+def load_llm_payload(response: str):
+    """Decode the model answer, recovering from fences and surrounding prose."""
+    candidates = [response, strip_code_fence(response)]
+    candidates.append(strip_code_fence(extract_json_object(response) or ""))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
 
 def parse_dbml_response(
     response: str, include_intent: bool = False
 ) -> dict[str, str]:
     response = response.strip()
 
-    try:
-        payload = json.loads(response)
-    except json.JSONDecodeError:
-        payload = None
+    payload = load_llm_payload(response)
 
     if isinstance(payload, dict):
-        dbml = payload.get("dbml")
-        summary = payload.get("summary")
-        explanation = payload.get("explanation")
-        intent = payload.get("intent", "SCHEMA")
-
-        if not all(
-            isinstance(value, str) for value in (dbml, summary, explanation, intent)
-        ):
-            raise ValueError("Invalid DBML response format from LLM.")
+        dbml = unescape_llm_text(coerce_llm_field(payload.get("dbml")))
+        summary = unescape_llm_text(coerce_llm_field(payload.get("summary")))
+        explanation = unescape_llm_text(coerce_llm_field(payload.get("explanation")))
+        intent = coerce_llm_field(payload.get("intent")).strip().upper() or "SCHEMA"
 
         if intent not in VALID_LLM_INTENTS:
-            raise ValueError("Invalid LLM intent.")
+            intent = "SCHEMA"
 
         if not explanation.strip() or (intent == "SCHEMA" and not summary.strip()):
             raise ValueError("Invalid DBML response from LLM.")
 
         result = {
-            "dbml_query": (dbml).strip(),
-            "updated_summary": normalize_llm_text(summary).strip(),
-            "explanation": (explanation).strip(),
+            "dbml_query": dbml.strip(),
+            "updated_summary": summary.strip(),
+            "explanation": explanation.strip(),
         }
         if include_intent:
             result["intent"] = intent
@@ -115,19 +196,25 @@ def parse_dbml_response(
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
-        r"\s*DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
+        r"\s*(?:INTENT:\s*(?P<intent>[A-Z_]+)\s*)?"
+        r"DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
         r"(?P<summary>.*?)\s*EXPLANATION:\s*(?P<explanation>.*?)\s*",
         response,
         flags=re.DOTALL,
     )
     if not match:
+        logger.info("Match: %s", match)
         raise ValueError("Invalid DBML response format from LLM.")
 
     dbml = match.group("dbml").strip()
     summary = match.group("summary").strip()
     explanation = match.group("explanation").strip()
+    intent = (match.group("intent") or "SCHEMA").strip()
 
-    if not summary or not explanation:
+    if intent not in VALID_LLM_INTENTS:
+        raise ValueError("Invalid LLM intent.")
+
+    if not explanation.strip() or (intent == "SCHEMA" and not summary.strip()):
         raise ValueError("Invalid DBML response from LLM.")
 
     result = {
@@ -136,7 +223,7 @@ def parse_dbml_response(
         "explanation": explanation,
     }
     if include_intent:
-        result["intent"] = "SCHEMA"
+        result["intent"] = intent
     return result
 
 

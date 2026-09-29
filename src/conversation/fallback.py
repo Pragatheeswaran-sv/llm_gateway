@@ -186,6 +186,20 @@ def get_candidate_models(
     return eligible
 
 
+def _rejects_response_format(exc: Exception) -> bool:
+    """True when the provider refused JSON mode because it does not support it."""
+    status = _status_code(exc)
+    if status not in (400, 404, 415, 422):
+        return False
+    body = getattr(exc, "body", None)
+    message = f"{body} {exc}".lower()
+    return (
+        "response_format" in message
+        or "json_object" in message
+        or "json mode" in message
+    )
+
+
 def _call_openai_model(
     api_key: str,
     base_url: str,
@@ -194,14 +208,28 @@ def _call_openai_model(
     user_prompt: str,
 ) -> LLMCallResult:
     client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        temperature=DEFAULT_TEMPERATURE,
-        messages=[
+    request = {
+        "model": model_name,
+        "temperature": DEFAULT_TEMPERATURE,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-    )
+    }
+
+    try:
+        response = client.chat.completions.create(
+            **request,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        if not _rejects_response_format(exc):
+            raise
+        logger.info(
+            "Provider rejected response_format for model=%s; retrying without JSON mode",
+            model_name,
+        )
+        response = client.chat.completions.create(**request)
 
     content = (response.choices[0].message.content or "").strip() if response.choices else ""
     usage = getattr(response, "usage", None)
