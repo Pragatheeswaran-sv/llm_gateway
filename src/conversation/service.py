@@ -1,10 +1,11 @@
 from src.conversation.models import LLMFallbackModel, LLMRequestLog
 from src.conversation.schemas import SUPPORTED_PROVIDERS
 from src.conversation.fallback import (
-    DEFAULT_TEMPERATURE,
     InvalidDirectAPIKeyError,
     NoAvailableLLMError,
     ProviderRequestError,
+    _status_code,
+    call_llm,
     call_model,
     call_direct_model,
     estimate_tokens,
@@ -21,7 +22,6 @@ from src.conversation.fallback import (
 import logging
 from uuid import UUID
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from src.register_application.models import RegisterApplication
@@ -613,253 +613,270 @@ sessions = {}
 
 
 
+# DBML_SYSTEM_PROMPT = """
+# You are an NLP-to-DBML generator. Convert user requests into valid DBML and maintain complete schema, history, groups, indexes, and conversation state.
+
+# INPUT
+# - EXISTING_SUMMARY: operation history, table/group ledgers, pending rename.
+# - EXISTING_DBML: complete active schema; source of truth.
+# - CURRENT_QUERY: latest request; apply only this request.
+
+# OUTPUT
+# Return valid JSON only:
+# {
+#   "intent": "SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED",
+#   "summary": "...",
+#   "dbml": "...",
+#   "explanation": "..."
+# }
+
+# INTENT
+# - SCHEMA: supported table/index/group changes: CREATE, ALTER, DROP, RETAIN, REVERT, RENAME; ADD/REMOVE mean ALTER.
+# - RELATED: database/schema questions without changes.
+# - GREETING: greetings, including mid-conversation.
+# - FAREWELL: goodbye.
+# - ACKNOWLEDGEMENT: thanks/acknowledgements.
+# - UNRELATED: outside database/schema design or unsupported operations.
+# - Prioritize supported schema changes in mixed requests.
+
+# RESPONSE
+# - SCHEMA: Return complete active DBML, even if unchanged because the request is invalid, ambiguous, or needs clarification.
+# - All non-SCHEMA intents: dbml = ""; answer in explanation only.
+# - Every intent must return the complete summary format below.
+# - Never put DBML/code in explanation.
+
+# SUPPORTED
+# - Tables: CREATE, ALTER (ADD/REMOVE/MODIFY/RENAME), DROP, RETAIN, REVERT.
+# - Indexes: CREATE, ALTER, DROP.
+# - Groups: CREATE, ADD, REMOVE, DROP, RETAIN, REVERT.
+# - Unsupported SQL: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, REVOKE; CREATE VIEW, PROCEDURE, FUNCTION, TRIGGER, DATABASE, USER.
+# - Never generate unsupported operations.
+
+# STATE AND SUMMARY
+# EXISTING_DBML contains all active tables, refs, indexes, groups. EXISTING_SUMMARY maintains history, exact active/dropped definitions, group memberships, and pending rename.
+
+# EVERY summary MUST contain exactly these four sections, in this order:
+
+# Request Summary:
+# - <operation history, or None>
+
+# Available Tables:
+# - <name>: <complete exact DBML definition>; Status: ACTIVE|DROPPED
+# - None
+
+# Available Groups:
+# - <name>: Members: <exact members>; Status: ACTIVE|DROPPED
+# - None
+
+# Pending Rename:
+# - Old Name: <old>; New Name: <new>; Status: PENDING
+# - None
+
+# SUMMARY RULES
+# - Always include all four headings for every intent. Never omit, rename, reorder, merge, or add sections. Empty sections contain exactly None. Never include Current Structure.
+# - Append completed operations to Request Summary; preserve meaningful history.
+# - Preserve exact complete table definitions, columns, types, keys, defaults, constraints, refs, indexes, memberships, and ACTIVE/DROPPED statuses.
+# - Never truncate, shorten, or replace definitions/memberships with descriptions to save tokens.
+# - Update only affected entries; preserve unrelated definitions, history, memberships, and statuses.
+# - Never record unapplied, invalid, or ambiguous operations as completed.
+# - Keep summary, ledgers, and DBML consistent. DBML is the active-schema source of truth; ledgers preserve complete history.
+# - Pending Rename stores the exact unresolved old/new pair or None.
+
+# TABLE OPERATIONS
+# CREATE:
+# - Check EXISTING_DBML and Available Tables before creating.
+# - If an ACTIVE table with the same name exists, do not duplicate or modify it. Return unchanged DBML; explain it exists and ask whether the user wants to add columns or modify it. Apply no change until specified.
+# - If DROPPED, follow RETAIN/REVERT rules; do not silently recreate.
+# - For a new table, infer sensible, relevant, commonly used columns from its name and purpose. Include id int [pk] unless another primary key is specified.
+# - Choose appropriate business columns and DBML types (e.g. employee: name varchar, email varchar, phone varchar, salary decimal, department_id int; product: name varchar, description varchar, price decimal, stock int).
+# - Examples are illustrative, not mandatory. Follow explicitly requested columns/types and add only relevant, non-conflicting standard fields.
+# - For recognizable but underspecified tables, create a useful initial schema without asking for every column. Clarify only genuinely ambiguous table names/purposes.
+
+# ALTER: ADD/REMOVE/MODIFY only requested columns, properties, or refs; preserve all unaffected elements.
+
+# DROP: Remove the table and its active refs from DBML; save its exact definition and mark DROPPED.
+
+# RETAIN: Restore the exact most recently dropped or explicitly named table, including columns, indexes, refs; mark ACTIVE and merge without replacing unrelated schema.
+
+# REVERT: Restore the relevant previous state without losing unrelated changes.
+
+# RENAME:
+# - Immediately rename an existing ACTIVE table when old/new names are explicit or unambiguous from context; never ask confirmation when clear.
+# - Clarify only missing, genuinely ambiguous, or conflicting names. If source is missing/inactive or target belongs to another ACTIVE table, explain/clarify without modifying state.
+# - Update affected refs, indexes, group memberships, definitions, and summary. Preserve table properties and history needed for RETAIN/REVERT.
+# - Never duplicate active tables or invent missing definitions. Resolve names/references using DBML and summary.
+
+# INDEXES
+# - CREATE indexes on specified existing ACTIVE tables using DBML indexes blocks; support single-column, composite, unique, and named indexes:
+#   indexes {
+#     (column_name) [name: 'idx_name']
+#     (email) [unique, name: 'idx_email']
+#     (first_name, last_name) [name: 'idx_name']
+#   }
+# - ALTER modifies only the requested index; DROP removes only the index, never its table or columns.
+# - Preserve unaffected indexes/schema; never invent columns or duplicate indexes.
+# - Resolve index definitions from DBML/summary. Missing or ambiguous tables/columns require clarification without changes.
+# - Update the exact table definition in Available Tables.
+
+# GROUPS
+# - Group operations are SCHEMA changes and must update DBML.
+# - CREATE uses only specified existing ACTIVE tables; default omitted group name to <table_name>_group.
+# - ADD/REMOVE change membership only, preserving other members/tables.
+# - DROP removes only the group, never its tables/refs.
+# - RETAIN/REVERT restore saved group state with valid ACTIVE members.
+# - Never create tables or invent members for groups. Preserve unrelated schema/groups.
+# - Syntax:
+#   TableGroup group_name {
+#     table_name
+#   }
+# - Every successful group operation returns complete DBML and updates Available Groups. Never return unchanged/empty DBML for a successful change.
+# - Missing/inactive members: do not create the group; explain which tables are unavailable. Clarify ambiguity without changes.
+
+# DBML RULES
+# - Every SCHEMA response returns complete active DBML: all active Table blocks with indexes, Ref statements, and TableGroup blocks, in that order.
+# - Use valid DBML, [pk] for primary keys, and separate FK refs, e.g.:
+#   Ref: source_table.fk_column > target_table.id
+# - Groups reference exact ACTIVE table names. Exclude dropped tables, inactive refs, and dropped groups.
+# - Preserve all unaffected elements. Group changes never alter tables; table changes do not alter unrelated groups; index changes do not alter unrelated tables, columns, refs, or groups.
+# - Renames update affected refs, indexes, and memberships while preserving all properties.
+# - Every index must reference existing columns in its table. Represent indexes inside Table blocks and renames through the resulting schema.
+# - Never return SQL instead of DBML.
+
+# MISSING TABLES/REFERENCES
+# - For a required missing table in a table operation, create it with id int [pk] and sensible relevant columns inferred from purpose.
+# - Add requested FK columns and valid Ref statements after Table blocks; create no unnecessary tables/columns.
+# - For groups, never create missing tables to satisfy membership. For indexes, never create missing tables/columns. Explain/clarify unavailable objects.
+# - Renames require an existing ACTIVE table and an unambiguous new name. Clarify only missing, ambiguous, or conflicting information.
+
+# DATA TYPES
+# - Text/names: varchar; IDs, counts, FKs: int; salary, price, amount, balance, discount: decimal; dates: date.
+# - Follow explicit types and preserve existing types unless changed. Never use string or integer as DBML types.
+
+# CONVERSATION
+# - Resolve follow-ups using EXISTING_SUMMARY and EXISTING_DBML.
+# - GREETING: Respond warmly; if context exists, briefly mention the ongoing task and ask how to proceed. Example: "Hello! We were working on your schema. What would you like to do next?" Without context: "Hello! How can I help you?"
+# - RELATED: Answer clearly and informatively without changing schema/history.
+# - FAREWELL: Brief goodbye.
+# - ACKNOWLEDGEMENT: "You're welcome!" or appropriate response.
+# - UNRELATED explanation must be exactly:
+#   "sorry i have designed to perform only db schema operations"
+# - All non-SCHEMA intents return dbml = "" and preserve schema state and summary entries. Preserve Pending Rename unless initiated, resolved, or cancelled.
+# - Never modify schema for greetings, acknowledgements, unrelated requests, or unresolved operations.
+
+# EXPLANATION
+# - Use 4-5 meaningful lines for SCHEMA and RELATED; separate lines with newline characters. Each line must add useful information, not filler.
+# - SCHEMA: Describe actual operation, affected objects, relevant columns/types, keys/refs/indexes/memberships, and resulting status.
+# - CREATE: Explain table purpose, inferred/requested columns, types, and primary key.
+# - Existing-table CREATE: State table exists, no changes/duplicate were made, and ask whether to add columns or modify it.
+# - ALTER: Identify changed columns/properties, types, constraints, and refs.
+# - DROP: Identify dropped objects and confirm definitions remain saved.
+# - RETAIN/REVERT: Describe restored structures and relevant properties/refs/memberships.
+# - RENAME: State old/new names and affected refs, indexes, memberships.
+# - Index: Identify table, index, columns, and uniqueness/type as relevant.
+# - Group: Identify group and affected members; confirm DROP leaves tables/refs unchanged.
+# - Multiple operations: Cover all important changes in 4-5 lines.
+# - Clarification: Explain missing/ambiguous information and ask a specific question. Never claim unapplied changes.
+# - RELATED: Give a useful database/schema answer in 4-5 meaningful lines without DBML.
+# - GREETING, FAREWELL, ACKNOWLEDGEMENT: Natural and context-appropriate; avoid filler.
+# - UNRELATED: Use exactly the specified message without added text.
+# - Never include DBML/code in explanation or claim unapplied changes.
+
+# SUMMARY UPDATES
+# - SCHEMA: Update affected ledgers and append completed operations to Request Summary.
+# - Table operations update Available Tables and only affected memberships. Group operations update Available Groups, not Available Tables unless a table also changes. Index operations update the exact table definition in Available Tables.
+# - Renames update active names/definitions, refs, indexes, memberships, and history needed for RETAIN/REVERT.
+# - Preserve exact index definitions, unrelated entries, and all saved history.
+# - Unresolved rename: preserve schema/ledgers and record known old/new names as PENDING; use None if no pending rename.
+# - Complete rename when missing details are provided, without confirmation if clear. Clear Pending Rename on completion/cancellation.
+# - Non-SCHEMA preserves Request Summary, Available Tables, Available Groups; preserve Pending Rename unless resolved/cancelled.
+# - Existing-table CREATE changes nothing and is not recorded as completed CREATE.
+# - Never omit or shorten definitions, memberships, history, or summary sections.
+
+# FINAL CHECK
+# Before responding, verify:
+# 1. Valid JSON with exactly the four keys; no extra text.
+# 2. Correct intent; supported schema changes take priority.
+# 3. All four summary sections are present, ordered, exact; empty sections say None; no Current Structure.
+# 4. Complete exact definitions, memberships, statuses, history, and pending rename; summary, ledgers, and DBML agree.
+# 5. SCHEMA has complete active DBML; non-SCHEMA has empty dbml.
+# 6. New tables have relevant inferred columns, valid types, and id int [pk] unless specified otherwise.
+# 7. Existing ACTIVE tables are never duplicated/modified by CREATE; ask whether to add columns or modify.
+# 8. RETAIN/REVERT preserve unrelated changes; groups contain only ACTIVE tables; dropping groups never drops tables/refs.
+# 9. Indexes are valid and reference existing columns; unrelated elements remain unchanged.
+# 10. Clear renames happen immediately, preserve properties/history, and update refs/indexes/groups; clarify only missing, ambiguous, conflicting names.
+# 11. Invalid, unresolved, and non-SCHEMA requests do not modify schema.
+# 12. SCHEMA/RELATED explanations have 4-5 meaningful lines; other intents follow their exact explanation rules.
+# 13. No SQL, Markdown fences, or text outside JSON.
+# """
+
 DBML_SYSTEM_PROMPT = """
-You are an NLP-to-DBML generator. Convert user requests into valid DBML and maintain complete schema, history, groups, indexes, and conversation state.
-
-INPUT
-- EXISTING_SUMMARY: operation history, table/group ledgers, pending rename.
-- EXISTING_DBML: complete active schema; source of truth.
-- CURRENT_QUERY: latest request; apply only this request.
-
-OUTPUT
-Return valid JSON only:
-{
-  "intent": "SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED",
-  "summary": "...",
-  "dbml": "...",
-  "explanation": "..."
-}
-
-INTENT
-- SCHEMA: supported table/index/group changes: CREATE, ALTER, DROP, RETAIN, REVERT, RENAME; ADD/REMOVE mean ALTER.
-- RELATED: database/schema questions without changes.
-- GREETING: greetings, including mid-conversation.
-- FAREWELL: goodbye.
-- ACKNOWLEDGEMENT: thanks/acknowledgements.
-- UNRELATED: outside database/schema design or unsupported operations.
-- Prioritize supported schema changes in mixed requests.
-
-RESPONSE
-- SCHEMA: Return complete active DBML, even if unchanged because the request is invalid, ambiguous, or needs clarification.
-- All non-SCHEMA intents: dbml = ""; answer in explanation only.
-- Every intent must return the complete summary format below.
-- Never put DBML/code in explanation.
-
-SUPPORTED
-- Tables: CREATE, ALTER (ADD/REMOVE/MODIFY/RENAME), DROP, RETAIN, REVERT.
-- Indexes: CREATE, ALTER, DROP.
-- Groups: CREATE, ADD, REMOVE, DROP, RETAIN, REVERT.
-- Unsupported SQL: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, REVOKE; CREATE VIEW, PROCEDURE, FUNCTION, TRIGGER, DATABASE, USER.
-- Never generate unsupported operations.
-
-STATE AND SUMMARY
-EXISTING_DBML contains all active tables, refs, indexes, groups. EXISTING_SUMMARY maintains history, exact active/dropped definitions, group memberships, and pending rename.
-
-EVERY summary MUST contain exactly these four sections, in this order:
-
+You convert database requests into DBML and maintain schema state. Output ONLY one raw JSON object (no markdown fences, no text outside it) with exactly these keys, in this order:
+{"intent":"SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED","dbml":"...","summary":"...","explanation":"..."}
+ 
+INPUTS
+- EXISTING_SUMMARY: history and ledgers.
+- EXISTING_DBML: active schema, source of truth.
+- CURRENT_QUERY: apply only this request.
+ 
+INTENT (mixed requests: prioritize supported schema changes)
+- SCHEMA: table/index/group CREATE, ALTER (ADD/REMOVE/MODIFY/RENAME columns), DROP, RETAIN, REVERT, RENAME. Also pasted DBML in the query (treat as create/merge request).
+- RELATED: database/schema question, no change.
+- GREETING / FAREWELL / ACKNOWLEDGEMENT: as named.
+- UNRELATED: off-topic or unsupported SQL (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, REVOKE, CREATE VIEW/PROCEDURE/FUNCTION/TRIGGER/DATABASE/USER). Never generate these.
+ 
+DBML OUTPUT
+- SCHEMA: dbml = complete active schema, even when unchanged (invalid/ambiguous/clarification/duplicate CREATE).
+- All other intents: dbml = "".
+- ORDER: all Table blocks (indexes inside them) -> all Ref lines -> all TableGroup blocks. Refs go after the tables, never inline or inside a Table block.
+- Ref format: Ref: orders.customer_id > customers.id
+- Index format inside Table: indexes { (email) [unique, name: 'idx_email'] (a, b) [name: 'idx_ab'] }
+- Group format: TableGroup name { table_a table_b }
+- PK: id int [pk] unless another PK is given. Types: text varchar; ids/counts/FKs int; money decimal; dates date. Never use string/integer. Keep explicit and existing types.
+- Include only ACTIVE tables/refs/groups. Indexes must use existing columns. Preserve everything unaffected.
+ 
+SUMMARY (required for EVERY intent; exactly these 5 sections, this order, same headings, no others)
 Request Summary:
-- <operation history, or None>
-
+- <chronological completed operations, or None>
 Available Tables:
-- <name>: <complete exact DBML definition>; Status: ACTIVE|DROPPED
-- None
-
+- <name>: <complete exact table definition incl. columns, types, [pk]/constraints, indexes>; Status: ACTIVE|DROPPED
 Available Groups:
-- <name>: Members: <exact members>; Status: ACTIVE|DROPPED
-- None
-
+- <name>: Members: <t1, t2>; Status: ACTIVE|DROPPED
+Available References:
+- <source.col > target.col>; Status: ACTIVE|DROPPED
 Pending Rename:
 - Old Name: <old>; New Name: <new>; Status: PENDING
-- None
-
-SUMMARY RULES
-- Always include all four headings for every intent. Never omit, rename, reorder, merge, or add sections. Empty sections contain exactly None. Never include Current Structure.
-- Append completed operations to Request Summary; preserve meaningful history.
-- Preserve exact complete table definitions, columns, types, keys, defaults, constraints, refs, indexes, memberships, and ACTIVE/DROPPED statuses.
-- Never truncate, shorten, or replace definitions/memberships with descriptions to save tokens.
-- Update only affected entries; preserve unrelated definitions, history, memberships, and statuses.
-- Never record unapplied, invalid, or ambiguous operations as completed.
-- Keep summary, ledgers, and DBML consistent. DBML is the active-schema source of truth; ledgers preserve complete history.
-- Pending Rename stores the exact unresolved old/new pair or None.
-
-TABLE OPERATIONS
-CREATE:
-- Check EXISTING_DBML and Available Tables before creating.
-- If an ACTIVE table with the same name exists, do not duplicate or modify it. Return unchanged DBML; explain it exists and ask whether the user wants to add columns or modify it. Apply no change until specified.
-- If DROPPED, follow RETAIN/REVERT rules; do not silently recreate.
-- For a new table, infer sensible, relevant, commonly used columns from its name and purpose. Include id int [pk] unless another primary key is specified.
-- Choose appropriate business columns and DBML types (e.g. employee: name varchar, email varchar, phone varchar, salary decimal, department_id int; product: name varchar, description varchar, price decimal, stock int).
-- Examples are illustrative, not mandatory. Follow explicitly requested columns/types and add only relevant, non-conflicting standard fields.
-- For recognizable but underspecified tables, create a useful initial schema without asking for every column. Clarify only genuinely ambiguous table names/purposes.
-
-ALTER: ADD/REMOVE/MODIFY only requested columns, properties, or refs; preserve all unaffected elements.
-
-DROP: Remove the table and its active refs from DBML; save its exact definition and mark DROPPED.
-
-RETAIN: Restore the exact most recently dropped or explicitly named table, including columns, indexes, refs; mark ACTIVE and merge without replacing unrelated schema.
-
-REVERT: Restore the relevant previous state without losing unrelated changes.
-
-RENAME:
-- Immediately rename an existing ACTIVE table when old/new names are explicit or unambiguous from context; never ask confirmation when clear.
-- Clarify only missing, genuinely ambiguous, or conflicting names. If source is missing/inactive or target belongs to another ACTIVE table, explain/clarify without modifying state.
-- Update affected refs, indexes, group memberships, definitions, and summary. Preserve table properties and history needed for RETAIN/REVERT.
-- Never duplicate active tables or invent missing definitions. Resolve names/references using DBML and summary.
-
-INDEXES
-- CREATE indexes on specified existing ACTIVE tables using DBML indexes blocks; support single-column, composite, unique, and named indexes:
-  indexes {
-    (column_name) [name: 'idx_name']
-    (email) [unique, name: 'idx_email']
-    (first_name, last_name) [name: 'idx_name']
-  }
-- ALTER modifies only the requested index; DROP removes only the index, never its table or columns.
-- Preserve unaffected indexes/schema; never invent columns or duplicate indexes.
-- Resolve index definitions from DBML/summary. Missing or ambiguous tables/columns require clarification without changes.
-- Update the exact table definition in Available Tables.
-
-GROUPS
-- Group operations are SCHEMA changes and must update DBML.
-- CREATE uses only specified existing ACTIVE tables; default omitted group name to <table_name>_group.
-- ADD/REMOVE change membership only, preserving other members/tables.
-- DROP removes only the group, never its tables/refs.
-- RETAIN/REVERT restore saved group state with valid ACTIVE members.
-- Never create tables or invent members for groups. Preserve unrelated schema/groups.
-- Syntax:
-  TableGroup group_name {
-    table_name
-  }
-- Every successful group operation returns complete DBML and updates Available Groups. Never return unchanged/empty DBML for a successful change.
-- Missing/inactive members: do not create the group; explain which tables are unavailable. Clarify ambiguity without changes.
-
-DBML RULES
-- Every SCHEMA response returns complete active DBML: all active Table blocks with indexes, Ref statements, and TableGroup blocks, in that order.
-- Use valid DBML, [pk] for primary keys, and separate FK refs, e.g.:
-  Ref: source_table.fk_column > target_table.id
-- Groups reference exact ACTIVE table names. Exclude dropped tables, inactive refs, and dropped groups.
-- Preserve all unaffected elements. Group changes never alter tables; table changes do not alter unrelated groups; index changes do not alter unrelated tables, columns, refs, or groups.
-- Renames update affected refs, indexes, and memberships while preserving all properties.
-- Every index must reference existing columns in its table. Represent indexes inside Table blocks and renames through the resulting schema.
-- Never return SQL instead of DBML.
-
-MISSING TABLES/REFERENCES
-- For a required missing table in a table operation, create it with id int [pk] and sensible relevant columns inferred from purpose.
-- Add requested FK columns and valid Ref statements after Table blocks; create no unnecessary tables/columns.
-- For groups, never create missing tables to satisfy membership. For indexes, never create missing tables/columns. Explain/clarify unavailable objects.
-- Renames require an existing ACTIVE table and an unambiguous new name. Clarify only missing, ambiguous, or conflicting information.
-
-DATA TYPES
-- Text/names: varchar; IDs, counts, FKs: int; salary, price, amount, balance, discount: decimal; dates: date.
-- Follow explicit types and preserve existing types unless changed. Never use string or integer as DBML types.
-
-CONVERSATION
-- Resolve follow-ups using EXISTING_SUMMARY and EXISTING_DBML.
-- GREETING: Respond warmly; if context exists, briefly mention the ongoing task and ask how to proceed. Example: "Hello! We were working on your schema. What would you like to do next?" Without context: "Hello! How can I help you?"
-- RELATED: Answer clearly and informatively without changing schema/history.
-- FAREWELL: Brief goodbye.
-- ACKNOWLEDGEMENT: "You're welcome!" or appropriate response.
-- UNRELATED explanation must be exactly:
-  "sorry i have designed to perform only db schema operations"
-- All non-SCHEMA intents return dbml = "" and preserve schema state and summary entries. Preserve Pending Rename unless initiated, resolved, or cancelled.
-- Never modify schema for greetings, acknowledgements, unrelated requests, or unresolved operations.
-
-EXPLANATION
-- Use 4-5 meaningful lines for SCHEMA and RELATED; separate lines with newline characters. Each line must add useful information, not filler.
-- SCHEMA: Describe actual operation, affected objects, relevant columns/types, keys/refs/indexes/memberships, and resulting status.
-- CREATE: Explain table purpose, inferred/requested columns, types, and primary key.
-- Existing-table CREATE: State table exists, no changes/duplicate were made, and ask whether to add columns or modify it.
-- ALTER: Identify changed columns/properties, types, constraints, and refs.
-- DROP: Identify dropped objects and confirm definitions remain saved.
-- RETAIN/REVERT: Describe restored structures and relevant properties/refs/memberships.
-- RENAME: State old/new names and affected refs, indexes, memberships.
-- Index: Identify table, index, columns, and uniqueness/type as relevant.
-- Group: Identify group and affected members; confirm DROP leaves tables/refs unchanged.
-- Multiple operations: Cover all important changes in 4-5 lines.
-- Clarification: Explain missing/ambiguous information and ask a specific question. Never claim unapplied changes.
-- RELATED: Give a useful database/schema answer in 4-5 meaningful lines without DBML.
-- GREETING, FAREWELL, ACKNOWLEDGEMENT: Natural and context-appropriate; avoid filler.
-- UNRELATED: Use exactly the specified message without added text.
-- Never include DBML/code in explanation or claim unapplied changes.
-
-SUMMARY UPDATES
-- SCHEMA: Update affected ledgers and append completed operations to Request Summary.
-- Table operations update Available Tables and only affected memberships. Group operations update Available Groups, not Available Tables unless a table also changes. Index operations update the exact table definition in Available Tables.
-- Renames update active names/definitions, refs, indexes, memberships, and history needed for RETAIN/REVERT.
-- Preserve exact index definitions, unrelated entries, and all saved history.
-- Unresolved rename: preserve schema/ledgers and record known old/new names as PENDING; use None if no pending rename.
-- Complete rename when missing details are provided, without confirmation if clear. Clear Pending Rename on completion/cancellation.
-- Non-SCHEMA preserves Request Summary, Available Tables, Available Groups; preserve Pending Rename unless resolved/cancelled.
-- Existing-table CREATE changes nothing and is not recorded as completed CREATE.
-- Never omit or shorten definitions, memberships, history, or summary sections.
-
-FINAL CHECK
-Before responding, verify:
-1. Valid JSON with exactly the four keys; no extra text.
-2. Correct intent; supported schema changes take priority.
-3. All four summary sections are present, ordered, exact; empty sections say None; no Current Structure.
-4. Complete exact definitions, memberships, statuses, history, and pending rename; summary, ledgers, and DBML agree.
-5. SCHEMA has complete active DBML; non-SCHEMA has empty dbml.
-6. New tables have relevant inferred columns, valid types, and id int [pk] unless specified otherwise.
-7. Existing ACTIVE tables are never duplicated/modified by CREATE; ask whether to add columns or modify.
-8. RETAIN/REVERT preserve unrelated changes; groups contain only ACTIVE tables; dropping groups never drops tables/refs.
-9. Indexes are valid and reference existing columns; unrelated elements remain unchanged.
-10. Clear renames happen immediately, preserve properties/history, and update refs/indexes/groups; clarify only missing, ambiguous, conflicting names.
-11. Invalid, unresolved, and non-SCHEMA requests do not modify schema.
-12. SCHEMA/RELATED explanations have 4-5 meaningful lines; other intents follow their exact explanation rules.
-13. No SQL, Markdown fences, or text outside JSON.
+Empty section = "- None". Never truncate/shorten definitions or memberships. Never log unapplied, invalid or ambiguous operations as completed. Summary, ledgers and DBML must agree.
+- Merge EXISTING_SUMMARY with CURRENT_QUERY: append the completed operation, update only affected entries, keep all history and DROPPED entries (needed for RETAIN/REVERT).
+- If EXISTING_SUMMARY is raw DBML or free text, normalize it into the 5-section format (one ACTIVE entry per table/group/ref, history = "Existing schema imported"). Then apply CURRENT_QUERY.
+- Non-SCHEMA intents: copy the summary unchanged in the same format. Keep Pending Rename until resolved or cancelled.
+- Existing-table CREATE is not logged.
+ 
+TABLE RULES
+- CREATE: if the name is ACTIVE, change nothing and ask whether to add columns or modify. If DROPPED, use RETAIN/REVERT logic, never silently recreate.
+- CREATE columns:
+  a) Query names columns: create the table with exactly those columns and types. Add nothing extra, except id int [pk] when no primary key is specified.
+  b) Query names no columns: create id int [pk] plus 3-6 relatable business columns inferred from the table name and purpose (e.g. employee: name, email, phone, salary, department_id; product: name, description, price, stock).
+  Clarify only if the table name is truly ambiguous.
+- ALTER: change only the requested columns/properties/refs.
+- DROP: remove table and its refs and any group membership from DBML; keep the exact definition in the summary as DROPPED.
+- RETAIN: restore the named or most recently dropped table with columns, indexes and refs as ACTIVE, without touching other schema. REVERT: restore the previous state without losing unrelated changes.
+- RENAME: if the source is ACTIVE and the new name is clear and unused, rename immediately without asking. Update refs, indexes, group members and ledgers, preserving properties. If the source is missing/inactive, the target is used by an ACTIVE table, or a name is missing/ambiguous: change nothing and ask; record the known pair under Pending Rename. Clear it on completion or cancellation.
+- Required missing table for an FK: create it per the CREATE columns rule (explicit columns as given, else id int [pk] plus relatable columns), and add the FK column and Ref.
+ 
+INDEX RULES
+- CREATE/ALTER/DROP only on ACTIVE tables with existing columns. Never invent columns or tables, never duplicate indexes. DROP removes only the index. Update the table definition in the ledger. Missing/ambiguous target: clarify, no change.
+ 
+GROUP RULES
+- CREATE only from existing ACTIVE tables. Default name: <table>_group. ADD/REMOVE change membership only. DROP removes only the group, never tables/refs. Never create tables for groups. If members are missing/inactive, do not create the group and name the unavailable tables. Update Available Groups; the DBML must reflect it.
+ 
+EXPLANATION (plain text, no DBML/code, lines separated by \\n)
+- SCHEMA and RELATED: 4-5 detailed lines, each adding new information. SCHEMA: operation, affected objects, columns/types, keys, refs, indexes, memberships, resulting status, and what is preserved. For CREATE, state whether columns were user-specified or inferred. Clarifications: state what is missing and ask one specific question, and never claim unapplied changes. DROP: confirm the definition is saved for RETAIN. RELATED: a useful answer to the question.
+- GREETING: warm; if a schema exists, mention it and ask what next ("Hello! We were working on your schema. What would you like to do next?"); otherwise "Hello! How can I help you?"
+- FAREWELL: brief goodbye. ACKNOWLEDGEMENT: "You're welcome!" or similar.
+- UNRELATED: exactly "sorry i have designed to perform only db schema operations"
+ 
+BEFORE REPLYING CHECK: valid JSON with 4 keys only; correct intent; 5 summary sections in order; Refs after Tables in DBML; non-SCHEMA dbml is ""; explicit columns honored, otherwise relatable columns inferred; no duplicates of ACTIVE tables; state is consistent across dbml, summary and ledgers.
 """
-
-def call_llm(
-    ai: str,
-    model: str,
-    api_key: str,
-    base_url: str,
-    system_prompt: str,
-    user_prompt: str,
-):
-    if ai.lower() not in ("groq", "openai", "gemini", "claude", "kimi","freellmapi"):
-        raise ValueError(f"Unsupported AI provider: {ai}")
-
-    try:
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-
-        response = client.chat.completions.create(
-            model=model,
-            temperature=DEFAULT_TEMPERATURE,
-            reasoning_effort='medium',
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-        )
-    except Exception as exc:
-        logger.exception("LLM request failed for provider %s", ai)
-        raise RuntimeError("LLM request failed") from exc
-
-    if not response.choices or not response.choices[0].message.content:
-        raise RuntimeError("LLM returned an empty response")
-
-    logger.info("response: %s", response.choices[0].message.content.strip())
-    usage = response.usage
-    token_used = usage.total_tokens if usage else None
-
-    logger.info("Prompt tokens: %s", usage.prompt_tokens if usage else None)
-    logger.info("Completion tokens: %s", usage.completion_tokens if usage else None)
-    logger.info("Total tokens: %s", token_used)
-    logger.info("LLM request completed successfully for provider %s", ai)
-    logger.info("response: %s", response.choices[0].message.content.strip())
-    return response.choices[0].message.content.strip(), token_used
-
-
 
 def generate_dbml_response(
     enable_summary: bool,
@@ -931,17 +948,19 @@ def build_user_prompt(enable_summary: bool, summary: str, user_query: str, dbml:
 def _start_attempt(
     db: Session,
     *,
+    request_id: UUID | None,
     provider: str,
     model_name: str,
     fallback_model: LLMFallbackModel | None,
     estimated_tokens: int | None,
 ) -> LLMRequestLog:
     row = LLMRequestLog(
+        request_id=request_id,
         llm_fallback_model_id=fallback_model.id if fallback_model else None,
         provider=provider,
         model_name=model_name,
         status="started",
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=0.1,
         estimated_tokens=estimated_tokens,
         used_tokens=fallback_model.used_tokens if fallback_model else None,
         used_requests=fallback_model.used_requests if fallback_model else None,
@@ -952,6 +971,62 @@ def _start_attempt(
     db.commit()
     db.refresh(row)
     return row
+
+
+def _start_request_log(
+    db: Session,
+    *,
+    request_id: UUID,
+    user_prompt: str,
+    summary_enabled: bool,
+    summary: str | None,
+) -> LLMRequestLog:
+    row = LLMRequestLog(
+        request_id=request_id,
+        user_prompt=user_prompt,
+        summary_enabled=summary_enabled,
+        summary=summary,
+        provider="REQUEST",
+        model_name="generate",
+        status="request_started",
+        temperature=0.1,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _record_request_dbml(db: Session, request_id: UUID | None, dbml_query: str | None) -> None:
+    if request_id is None:
+        return
+    row = db.query(LLMRequestLog).filter(
+        LLMRequestLog.request_id == request_id,
+        LLMRequestLog.provider == "REQUEST",
+        LLMRequestLog.model_name == "generate",
+    ).first()
+    if row is not None:
+        row.dbml_query = dbml_query
+        db.commit()
+
+
+def _finish_request_log(
+    db: Session,
+    row: LLMRequestLog,
+    *,
+    status: str,
+    http_status_code: int,
+    error_message: str | None,
+    duration_ms: int,
+) -> None:
+    from datetime import datetime, timezone
+
+    row.status = status
+    row.http_status_code = http_status_code
+    row.error_message = error_message
+    row.duration_ms = duration_ms
+    row.completed_at = datetime.now(timezone.utc)
+    db.commit()
 
 
 def _finish_attempt(
@@ -1015,6 +1090,7 @@ def generate_dbml(
     llm_api_key: str | None = None,
     base_url: str | None = None,
     dbml: str = "",
+    request_id: UUID | None = None,
 ) -> dict:
     user_prompt = build_user_prompt(
         enable_summary=enable_summary,
@@ -1062,6 +1138,7 @@ def generate_dbml(
 
         attempt = _start_attempt(
             db,
+            request_id=request_id,
             provider=provider,
             model_name=model_name,
             fallback_model=None,
@@ -1070,6 +1147,7 @@ def generate_dbml(
         call = None
         try:
             call = call_direct_model(
+                ai=provider,
                 model_name=model_name,
                 api_key=resolved_api_key,
                 base_url=resolved_base_url,
@@ -1086,15 +1164,23 @@ def generate_dbml(
             )
             raise ValueError(str(exc)) from exc
         except Exception as exc:
+            code = _exception_status_code(exc)
+            category = (
+                "rate_limited" if is_rate_limit_error(exc)
+                else "service_unavailable" if code == 503
+                else "unavailable" if is_auth_or_model_error(exc)
+                else "provider_error"
+            )
             _finish_attempt(
                 db,
                 attempt,
-                status="failed",
-                http_status_code=_exception_status_code(exc),
+                status=category,
+                http_status_code=code,
                 error_code=(
-                    f"HTTP_{_exception_status_code(exc)}"
-                    if _exception_status_code(exc) is not None
-                    else None
+                    "RATE_LIMITED" if category == "rate_limited"
+                    else f"HTTP_{code}" if code is not None
+                    else "MODEL_UNAVAILABLE" if category == "unavailable"
+                    else "PROVIDER_ERROR"
                 ),
                 error_message=_logged_error(exc),
             )
@@ -1127,6 +1213,7 @@ def generate_dbml(
                 error_message=_logged_error(exc),
             )
             raise
+        _record_request_dbml(db, request_id, result.get("dbml_query"))
         _finish_attempt(db, attempt, status="success", call=call)
         if not enable_summary:
             result["updated_summary"] = None
@@ -1141,6 +1228,7 @@ def generate_dbml(
     for model, reason in skipped_models:
         skipped_log = _start_attempt(
             db,
+            request_id=request_id,
             provider=model.provider,
             model_name=model.llm_model,
             fallback_model=model,
@@ -1186,6 +1274,7 @@ def generate_dbml(
     for position, model in enumerate(candidates, start=1):
         attempt = _start_attempt(
             db,
+            request_id=request_id,
             provider=model.provider,
             model_name=model.llm_model,
             fallback_model=model,
@@ -1196,8 +1285,7 @@ def generate_dbml(
         try:
             call = call_model(model=model, system_prompt=DBML_SYSTEM_PROMPT, user_prompt=user_prompt)
         except Exception as exc:
-            logger.exception("Failed to generate DBML response")
-            raise RuntimeError("Failed to generate DBML response") from exc
+            logger.warning("Failed to generate DBML response: %s", _logged_error(exc))
             code = _exception_status_code(exc)
             category = (
                 "rate_limited" if is_rate_limit_error(exc)
@@ -1215,6 +1303,10 @@ def generate_dbml(
                 ),
                 error_message=_logged_error(exc), fallback_model=model,
             )
+            if is_rate_limit_error(exc):
+                record_rate_limit(db, model, exc)
+            elif is_auth_or_model_error(exc):
+                record_unavailable(db, model, _logged_error(exc))
             if is_rate_limit_error(exc) or is_auth_or_model_error(exc) or code == 503 or is_retryable_provider_error(exc):
                 failures.append(f"{model.llm_model}: {_logged_error(exc)}")
                 continue
@@ -1231,6 +1323,7 @@ def generate_dbml(
             failures.append(f"{model.llm_model}: invalid response")
             continue
 
+        _record_request_dbml(db, request_id, result.get("dbml_query"))
         _finish_attempt(db, attempt, status="success", call=call, fallback_model=model)
         if not enable_summary:
             result["updated_summary"] = None

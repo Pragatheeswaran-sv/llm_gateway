@@ -94,6 +94,7 @@ def parse_dbml_response(
         if not all(
             isinstance(value, str) for value in (dbml, summary, explanation, intent)
         ):
+            print(f"Invalid DBML response format from LLM from not all parse_dbml_response values are strings: {payload}")
             raise ValueError("Invalid DBML response format from LLM.")
 
         if intent not in VALID_LLM_INTENTS:
@@ -112,6 +113,7 @@ def parse_dbml_response(
         return result
 
     if "```" in response or "\\n" in response or "\\t" in response:
+        print(f"Invalid DBML response format from LLM '\\n': {response}")
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
@@ -121,6 +123,7 @@ def parse_dbml_response(
         flags=re.DOTALL,
     )
     if not match:
+        print(f"Invalid DBML response format from LLM match : {response}{match}")
         raise ValueError("Invalid DBML response format from LLM.")
 
     dbml = match.group("dbml").strip()
