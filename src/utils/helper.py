@@ -57,12 +57,19 @@ def validate_dbml(dbml: str) -> bool:
 
 
 def normalize_llm_text(value: str) -> str:
-    """Convert escape sequences that survived JSON decoding into characters."""
-    return (
-        value.replace("\\", " ")
-        .replace("\n", " ")
-        .replace("\t", " ")
-    )
+    """Convert escaped control sequences from LLM output to real characters."""
+
+    value = re.sub(r"\\+n", "\n", value)
+    value = re.sub(r"\\+r", "\r", value)
+    value = re.sub(r"\\+t", "\t", value)
+
+    return value
+
+
+def flatten_llm_text(value: str) -> str:
+    """Normalize escaped sequences and collapse whitespace to spaces."""
+    return " ".join(normalize_llm_text(value).split())
+
 
 
 VALID_LLM_INTENTS = {
@@ -80,17 +87,19 @@ def parse_dbml_response(
 ) -> dict[str, str]:
     response = response.strip()
 
+    json_error = None
     try:
         payload = json.loads(response)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         payload = None
+        json_error = exc
 
     if isinstance(payload, dict):
         dbml = payload.get("dbml")
         summary = payload.get("summary")
         explanation = payload.get("explanation")
         intent = payload.get("intent", "SCHEMA")
-
+        
         if not all(
             isinstance(value, str) for value in (dbml, summary, explanation, intent)
         ):
@@ -104,24 +113,27 @@ def parse_dbml_response(
             raise ValueError("Invalid DBML response from LLM.")
 
         result = {
-            "dbml_query": (dbml).strip(),
-            "updated_summary": normalize_llm_text(summary).strip(),
-            "explanation": (explanation).strip(),
+            "dbml_query": normalize_llm_text(dbml).strip(),
+            "updated_summary": flatten_llm_text(summary).strip(),
+            "explanation": flatten_llm_text(explanation),
         }
+        print(f"parse_dbml_response result: {result}")
         if include_intent:
             result["intent"] = intent
         return result
 
-    if "```" in response or "\\n" in response or "\\t" in response:
+    if "```" in response:
         print(f"Invalid DBML response format from LLM '\\n': {response}")
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
-        r"\s*DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
+        r"\s*(?:INTENT:\s*(?P<intent>[A-Z_]+)\s*)?"
+        r"DBML:\s*(?P<dbml>.*?)\s*SUMMARY:\s*"
         r"(?P<summary>.*?)\s*EXPLANATION:\s*(?P<explanation>.*?)\s*",
         response,
         flags=re.DOTALL,
     )
+    print(f"match+response: {match}{response}")
     if not match:
         print(f"Invalid DBML response format from LLM match : {response}{match}")
         raise ValueError("Invalid DBML response format from LLM.")
@@ -134,9 +146,9 @@ def parse_dbml_response(
         raise ValueError("Invalid DBML response from LLM.")
 
     result = {
-        "dbml_query": dbml,
-        "updated_summary": summary,
-        "explanation": explanation,
+        "dbml_query": normalize_llm_text(dbml),
+        "updated_summary": flatten_llm_text(summary),
+        "explanation": flatten_llm_text(explanation),
     }
     if include_intent:
         result["intent"] = "SCHEMA"

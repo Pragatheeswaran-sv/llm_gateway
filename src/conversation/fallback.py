@@ -196,45 +196,6 @@ def get_candidate_models(
     return eligible
 
 
-def _call_openai_model(
-    api_key: str,
-    base_url: str,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> LLMCallResult:
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    content = (response.choices[0].message.content or "").strip() if response.choices else ""
-    usage = getattr(response, "usage", None)
-    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
-    logger.info('content: %s', content)
-    logger.info(
-        "LLM success model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
-        model_name,
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-    )
-
-    return LLMCallResult(
-        content=content,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-    )
-
-
 def call_llm(
     ai: str,
     model: str,
@@ -242,6 +203,7 @@ def call_llm(
     base_url: str,
     system_prompt: str,
     user_prompt: str,
+    # decrypt_direct_key: bool = False,
 ) -> LLMCallResult:
     """Make one OpenAI-compatible provider call and normalize provider errors."""
     from src.conversation.schemas import SUPPORTED_PROVIDERS
@@ -251,18 +213,52 @@ def call_llm(
     if not api_key or not api_key.strip():
         raise InvalidDirectAPIKeyError("llm_api_key is required")
 
+    # supplied_api_key = api_key
+    if settings.API_KEY_ENCRYPTION_KEY:
+        try:
+            api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
+        except Exception:
+            # Direct callers may supply a provider-native, unencrypted key.
+            api_key = api_key
+
     try:
-        return _call_openai_model(
-            api_key=api_key,
-            base_url=base_url,
-            model_name=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        content = (
+            response.choices[0].message.content or ""
+        ).strip() if response.choices else ""
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        logger.info(
+            "LLM success provider=%s model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            ai,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+        return LLMCallResult(
+            content=content,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
     except Exception as exc:
         status_code = _status_code(exc)
         provider_message = _provider_error_message(exc)
-        provider_message = provider_message.replace(api_key, "[redacted]")
+        for secret in (api_key):
+            if secret:
+                provider_message = provider_message.replace(secret, "[redacted]")
         message = {
             400: "The provider rejected the request. Check the model and base_url.",
             401: "The provider rejected the API key. Check the key and base_url.",
@@ -297,35 +293,6 @@ def call_model(model: LLMFallbackModel, system_prompt: str, user_prompt: str) ->
         model=model.llm_model,
         api_key=api_key,
         base_url=model.api_base_url,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-    )
-
-
-def call_direct_model(
-    ai: str,
-    model_name: str,
-    api_key: str,
-    base_url: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> LLMCallResult:
-    if not api_key or not api_key.strip():
-        raise InvalidDirectAPIKeyError("llm_api_key is required")
-
-    decrypted_api_key = api_key
-    if settings.API_KEY_ENCRYPTION_KEY:
-        try:
-            decrypted_api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
-        except Exception:
-            # Direct requests may provide either an encrypted or provider-native key.
-            decrypted_api_key = api_key
-
-    return call_llm(
-        ai=ai,
-        model=model_name,
-        api_key=decrypted_api_key,
-        base_url=base_url,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
     )

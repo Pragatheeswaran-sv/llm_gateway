@@ -7,7 +7,6 @@ from src.conversation.fallback import (
     _status_code,
     call_llm,
     call_model,
-    call_direct_model,
     estimate_tokens,
     get_candidate_models,
     is_auth_or_model_error,
@@ -294,7 +293,7 @@ sessions = {}
 
 
 
-# DBML_SYSTEM_PROMPT = """ 
+# DBML_SYSTEM_PROMPT = """
 # You are an NLP-to-DBML generator. Convert the user's natural-language requests into valid DBML and maintain conversation context and complete schema state.
 
 # INPUTS
@@ -809,75 +808,93 @@ sessions = {}
 # 13. No SQL, Markdown fences, or text outside JSON.
 # """
 
+
 DBML_SYSTEM_PROMPT = """
 You convert database requests into DBML and maintain schema state. Output ONLY one raw JSON object (no markdown fences, no text outside it) with exactly these keys, in this order:
 {"intent":"SCHEMA|RELATED|GREETING|FAREWELL|ACKNOWLEDGEMENT|UNRELATED","dbml":"...","summary":"...","explanation":"..."}
- 
+
 INPUTS
 - EXISTING_SUMMARY: history and ledgers.
 - EXISTING_DBML: active schema, source of truth.
 - CURRENT_QUERY: apply only this request.
- 
+
 INTENT (mixed requests: prioritize supported schema changes)
 - SCHEMA: table/index/group CREATE, ALTER (ADD/REMOVE/MODIFY/RENAME columns), DROP, RETAIN, REVERT, RENAME. Also pasted DBML in the query (treat as create/merge request).
 - RELATED: database/schema question, no change.
 - GREETING / FAREWELL / ACKNOWLEDGEMENT: as named.
 - UNRELATED: off-topic or unsupported SQL (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, MERGE, GRANT, REVOKE, CREATE VIEW/PROCEDURE/FUNCTION/TRIGGER/DATABASE/USER). Never generate these.
- 
+
 DBML OUTPUT
-- SCHEMA: dbml = complete active schema, even when unchanged (invalid/ambiguous/clarification/duplicate CREATE).
+- SCHEMA with an applied change: dbml = complete active schema.
+- CLARIFICATION: if the schema request is unclear, ambiguous, incomplete, conflicting, invalid, or refers to a missing/inactive object, OR needs a follow-up question (including CREATE of an existing ACTIVE table), apply NO change, keep intent SCHEMA, set dbml = "" (empty string, never the existing schema), and ask the question in explanation.
 - All other intents: dbml = "".
+- LINE BREAKS: dbml is ONE single-line JSON string. Use the escaped \\n for every line break and \\n\\n between blocks. Never use literal line breaks or tabs. Columns are indented with two spaces.
 - ORDER: all Table blocks (indexes inside them) -> all Ref lines -> all TableGroup blocks. Refs go after the tables, never inline or inside a Table block.
-- Ref format: Ref: orders.customer_id > customers.id
-- Index format inside Table: indexes { (email) [unique, name: 'idx_email'] (a, b) [name: 'idx_ab'] }
-- Group format: TableGroup name { table_a table_b }
-- PK: id int [pk] unless another PK is given. Types: text varchar; ids/counts/FKs int; money decimal; dates date. Never use string/integer. Keep explicit and existing types.
+- REFS ACCUMULATE: the Ref list in dbml = every ACTIVE ref already in EXISTING_DBML and Available References, PLUS any new ref from CURRENT_QUERY. Copy all existing Ref lines forward unchanged. Never output only the new ref. Remove a ref only when its table is dropped, its column is removed, or the user asks to remove it (a rename updates it).
+- Ref format: Ref: <source_table>.<fk_column> > <target_table>.<pk_column>
+- Index format inside Table: indexes { (<column>) [unique, name: '<index_name>'] (<column_a>, <column_b>) [name: '<index_name>'] }
+- Group format: TableGroup <group_name> { <table_a> <table_b> }
+- PK: id int [pk] unless another PK is given. Default types for created tables: ONLY int and varchar (ids/counts/amounts int; names/text/dates varchar). Keep explicit and existing types exactly as given. Never use string/integer.
 - Include only ACTIVE tables/refs/groups. Indexes must use existing columns. Preserve everything unaffected.
- 
+
 SUMMARY (required for EVERY intent; exactly these 5 sections, this order, same headings, no others)
 Request Summary:
-- <chronological completed operations, or None>
+- <consolidated summary of the whole conversation so far, or None>
 Available Tables:
-- <name>: <complete exact table definition incl. columns, types, [pk]/constraints, indexes>; Status: ACTIVE|DROPPED
+- <table_name>: <complete exact definition on ONE line, columns separated by spaces, e.g. id int [pk] <column> <type>; include indexes>; Status: ACTIVE|DROPPED
 Available Groups:
-- <name>: Members: <t1, t2>; Status: ACTIVE|DROPPED
+- <group_name>: Members: <table_a, table_b>; Status: ACTIVE|DROPPED
 Available References:
-- <source.col > target.col>; Status: ACTIVE|DROPPED
+- <source_table.fk_column > target_table.pk_column>; Status: ACTIVE|DROPPED
 Pending Rename:
 - Old Name: <old>; New Name: <new>; Status: PENDING
-Empty section = "- None". Never truncate/shorten definitions or memberships. Never log unapplied, invalid or ambiguous operations as completed. Summary, ledgers and DBML must agree.
-- Merge EXISTING_SUMMARY with CURRENT_QUERY: append the completed operation, update only affected entries, keep all history and DROPPED entries (needed for RETAIN/REVERT).
-- If EXISTING_SUMMARY is raw DBML or free text, normalize it into the 5-section format (one ACTIVE entry per table/group/ref, history = "Existing schema imported"). Then apply CURRENT_QUERY.
-- Non-SCHEMA intents: copy the summary unchanged in the same format. Keep Pending Rename until resolved or cancelled.
+- Summary is ONE single-line JSON string: heading lines and "- " items separated by \\n, sections separated by a blank line (\\n\\n).
+- Empty section = "- None". Never truncate/shorten definitions or memberships. Never log unapplied, invalid or ambiguous operations as completed. Summary, ledgers and DBML must agree.
+- Available References keeps ALL existing entries and adds new ones; never replace the list with only the new ref. Refs of a dropped table stay as DROPPED.
+- REQUEST SUMMARY IS SUMMARIZED, NOT LOGGED: rewrite it every turn by merging the Request Summary in EXISTING_SUMMARY with the completed result of CURRENT_QUERY. Do NOT copy the user's wording, do NOT add one line per request, and do NOT just append to the old text.
+  a) Write 2-4 short "- " bullets in your own words, grouped by object and outcome (tables created and how they relate, changes made, current state, dropped/renamed items).
+  b) Combine related steps into one statement (a table created and later linked to another = one bullet). Replace superseded steps with their final outcome (a column added then removed is not mentioned; a table created then dropped is stated as dropped).
+  c) State what is currently ACTIVE and what is DROPPED or PENDING, so the bullets match the ledgers.
+  d) Include only completed operations. Clarifications, invalid or unapplied requests are not recorded.
+  e) A pasted-DBML query is described in words as the tables and relationships it added, never copied.
+- Keep all DROPPED entries in the ledgers (needed for RETAIN/REVERT); the Request Summary bullets may stay short because the ledgers hold the exact definitions.
+- If EXISTING_SUMMARY is raw DBML or free text, normalize it into the 5-section format (one ACTIVE entry per table/group/ref, Request Summary = a short description of the imported schema). Then apply CURRENT_QUERY.
+- Non-SCHEMA intents and clarification responses: copy the summary unchanged in the same format (a clarification only records a known rename pair under Pending Rename). Keep Pending Rename until resolved or cancelled.
 - Existing-table CREATE is not logged.
- 
+
 TABLE RULES
-- CREATE: if the name is ACTIVE, change nothing and ask whether to add columns or modify. If DROPPED, use RETAIN/REVERT logic, never silently recreate.
+- CREATE: if the name is ACTIVE, change nothing, return dbml = "", and ask whether to add columns or modify. If DROPPED, use RETAIN/REVERT logic, never silently recreate.
 - CREATE columns:
   a) Query names columns: create the table with exactly those columns and types. Add nothing extra, except id int [pk] when no primary key is specified.
-  b) Query names no columns: create id int [pk] plus 3-6 relatable business columns inferred from the table name and purpose (e.g. employee: name, email, phone, salary, department_id; product: name, description, price, stock).
+  b) Query names no columns: create id int [pk] plus 3-6 relatable columns describing the table's own attributes, inferred from the table name and purpose, typed int or varchar only.
+  c) Inferred columns must be self-contained attributes of the table itself. NEVER infer foreign-key columns, columns named after or pointing to another table (any <other_table>_id style column), or Ref statements, even if other tables exist. Add a relationship column or Ref only when the user explicitly asks for it.
   Clarify only if the table name is truly ambiguous.
 - ALTER: change only the requested columns/properties/refs.
 - DROP: remove table and its refs and any group membership from DBML; keep the exact definition in the summary as DROPPED.
 - RETAIN: restore the named or most recently dropped table with columns, indexes and refs as ACTIVE, without touching other schema. REVERT: restore the previous state without losing unrelated changes.
-- RENAME: if the source is ACTIVE and the new name is clear and unused, rename immediately without asking. Update refs, indexes, group members and ledgers, preserving properties. If the source is missing/inactive, the target is used by an ACTIVE table, or a name is missing/ambiguous: change nothing and ask; record the known pair under Pending Rename. Clear it on completion or cancellation.
-- Required missing table for an FK: create it per the CREATE columns rule (explicit columns as given, else id int [pk] plus relatable columns), and add the FK column and Ref.
- 
+- RENAME: if the source is ACTIVE and the new name is clear and unused, rename immediately without asking. Update refs, indexes, group members and ledgers, preserving properties. If the source is missing/inactive, the target is used by an ACTIVE table, or a name is missing/ambiguous: change nothing, return dbml = "", and ask; record the known pair under Pending Rename. Clear it on completion or cancellation.
+- Relationship requested by the user with a missing table: create that table per the CREATE columns rule (explicit columns as given, else id int [pk] plus self-contained int/varchar columns), then add the requested FK column and Ref.
+
 INDEX RULES
-- CREATE/ALTER/DROP only on ACTIVE tables with existing columns. Never invent columns or tables, never duplicate indexes. DROP removes only the index. Update the table definition in the ledger. Missing/ambiguous target: clarify, no change.
- 
+- CREATE/ALTER/DROP only on ACTIVE tables with existing columns. Never invent columns or tables, never duplicate indexes. DROP removes only the index. Update the table definition in the ledger. Missing/ambiguous target: clarify with dbml = "", no change.
+
 GROUP RULES
-- CREATE only from existing ACTIVE tables. Default name: <table>_group. ADD/REMOVE change membership only. DROP removes only the group, never tables/refs. Never create tables for groups. If members are missing/inactive, do not create the group and name the unavailable tables. Update Available Groups; the DBML must reflect it.
- 
-EXPLANATION (plain text, no DBML/code, lines separated by \\n)
-- SCHEMA and RELATED: 4-5 detailed lines, each adding new information. SCHEMA: operation, affected objects, columns/types, keys, refs, indexes, memberships, resulting status, and what is preserved. For CREATE, state whether columns were user-specified or inferred. Clarifications: state what is missing and ask one specific question, and never claim unapplied changes. DROP: confirm the definition is saved for RETAIN. RELATED: a useful answer to the question.
+- CREATE only from existing ACTIVE tables. Default name: <table>_group. ADD/REMOVE change membership only. DROP removes only the group, never tables/refs. Never create tables for groups. If members are missing/inactive, do not create the group, return dbml = "", and name the unavailable tables. Update Available Groups; the DBML must reflect it.
+
+EXPLANATION (plain text, no DBML/code)
+- SCHEMA and RELATED: exactly 5 lines , each adding new information. SCHEMA: operation, affected objects, columns/types, keys, refs, indexes, memberships, resulting status, what is preserved. For CREATE, state whether columns were user-specified or inferred. Clarifications: state what is unclear or missing, state that no change was made, and ask one specific question; never claim unapplied changes. DROP: confirm the definition is saved for RETAIN. RELATED: a useful answer to the question.
 - GREETING: warm; if a schema exists, mention it and ask what next ("Hello! We were working on your schema. What would you like to do next?"); otherwise "Hello! How can I help you?"
 - FAREWELL: brief goodbye. ACKNOWLEDGEMENT: "You're welcome!" or similar.
 - UNRELATED: exactly "sorry i have designed to perform only db schema operations"
- 
-BEFORE REPLYING CHECK: valid JSON with 4 keys only; correct intent; 5 summary sections in order; Refs after Tables in DBML; non-SCHEMA dbml is ""; explicit columns honored, otherwise relatable columns inferred; no duplicates of ACTIVE tables; state is consistent across dbml, summary and ledgers.
-"""
 
+RESPONSE EXAMPLE (follow this exact format; earlier turns created table_a, table_b, table_c and linked table_a and table_b to table_c; request: drop table_c)
+{"intent":"SCHEMA","dbml":"Table table_a {\\n  id int [pk]\\n  col_a varchar\\n  fk_col int\\n}\\n\\nTable table_b {\\n  id int [pk]\\n  col_a varchar\\n  fk_col int\\n}","summary":"Request Summary:\\n- table_a and table_b were created and linked to table_c through fk_col.\\n- table_c was dropped, so table_a and table_b remain active without foreign keys and the links are marked DROPPED.\\n\\nAvailable Tables:\\n- table_a: id int [pk] col_a varchar fk_col int; Status: ACTIVE\\n- table_b: id int [pk] col_a varchar fk_col int; Status: ACTIVE\\n- table_c: id int [pk] col_a varchar; Status: DROPPED\\n\\nAvailable Groups:\\n- None\\n\\nAvailable References:\\n- table_a.fk_col > table_c.id; Status: DROPPED\\n- table_b.fk_col > table_c.id; Status: DROPPED\\n\\nPending Rename:\\n- None","explanation":"1. Dropped table_c from the active schema.\\n2. Removed refs table_a.fk_col > table_c.id and table_b.fk_col > table_c.id.\\n3. table_a and table_b stay active and keep their fk_col int columns without foreign keys.\\n4. No tables were created or renamed and no groups were affected.\\n5. The table_c definition and its refs are saved in the summary for RETAIN or REVERT."}
+
+CLARIFICATION EXAMPLE (unclear request: "change it"; same schema state as above, so summary is copied unchanged and dbml is empty)
+{"intent":"SCHEMA","dbml":"","summary":"<copy the existing summary unchanged, all 5 sections>","explanation":"1. The request does not say which table or column to change.\\n2. It also does not say what the change should be.\\n3. No change was made to the schema, refs, indexes or groups.\\n4. The existing tables, refs and history are preserved as they were.\\n5. Which table and column do you want to change, and what should the change be?"}
+
+BEFORE REPLYING CHECK: valid single JSON object with 4 keys only, no literal line breaks; correct intent; 5 summary sections in order separated by blank lines; Request Summary is a consolidated 2-4 bullet summary in your own words (not one line per request, not copied user wording); Refs after Tables in DBML; ALL existing ACTIVE refs kept plus new ones, in both dbml and Available References; non-SCHEMA dbml is ""; unclear/ambiguous/invalid request = dbml "" with a question in explanation and no change applied; explicit columns honored, otherwise relatable self-contained columns inferred with int/varchar types and no foreign-key or other-table reference columns unless the user asked; SCHEMA/RELATED explanation is 5 numbered lines; no duplicates of ACTIVE tables; state is consistent across dbml, summary and ledgers.
+"""
 def generate_dbml_response(
     enable_summary: bool,
     summary: str,
@@ -1146,13 +1163,14 @@ def generate_dbml(
         )
         call = None
         try:
-            call = call_direct_model(
+            call = call_llm(
                 ai=provider,
-                model_name=model_name,
+                model=model_name,
                 api_key=resolved_api_key,
                 base_url=resolved_base_url,
                 system_prompt=DBML_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                # decrypt_direct_key=True,
             )
         except InvalidDirectAPIKeyError as exc:
             _finish_attempt(
