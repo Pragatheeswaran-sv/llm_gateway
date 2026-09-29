@@ -9,13 +9,13 @@ from sqlalchemy.orm import Session
 
 from src.conversation.models import LLMFallbackModel
 from src.config import settings
+
 from src.utils.helper import decrypt_api_key
 
 logger = logging.getLogger(__name__)
 
 # Reserve output capacity during the pre-call TPM/TPD check.
 DEFAULT_OUTPUT_TOKEN_RESERVE = 300
-DEFAULT_TEMPERATURE = 0.1
 ACCOUNT_TURN = Sequence("llm_fallback_account_turn", start=1)
 
 
@@ -33,9 +33,19 @@ class NoAvailableLLMError(RuntimeError):
 
 
 class ProviderRequestError(RuntimeError):
-    def __init__(self, error: str, message: str = "The LLM provider request failed."):
+    def __init__(
+        self,
+        error: str,
+        message: str = "The LLM provider request failed.",
+        status_code: int | None = None,
+        response=None,
+        retryable: bool = False,
+    ):
         super().__init__(error)
         self.message = message
+        self.status_code = status_code
+        self.response = response
+        self.retryable = retryable
 
 
 class InvalidDirectAPIKeyError(ValueError):
@@ -186,97 +196,75 @@ def get_candidate_models(
     return eligible
 
 
-def _call_openai_model(
-    api_key: str,
-    base_url: str,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> LLMCallResult:
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        temperature=DEFAULT_TEMPERATURE,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    content = (response.choices[0].message.content or "").strip() if response.choices else ""
-    usage = getattr(response, "usage", None)
-    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
-
-    logger.info(
-        "LLM success model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
-        model_name,
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-    )
-
-    return LLMCallResult(
-        content=content,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-    )
-
-
-def call_model(model: LLMFallbackModel, system_prompt: str, user_prompt: str) -> LLMCallResult:
-    if not settings.API_KEY_ENCRYPTION_KEY:
-        raise RuntimeError("API_KEY_ENCRYPTION_KEY is not configured")
-
-    api_key = decrypt_api_key(model.api_key, settings.API_KEY_ENCRYPTION_KEY)
-    return _call_openai_model(
-        api_key=api_key,
-        base_url=model.api_base_url,
-        model_name=model.llm_model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-    )
-
-
-def call_direct_model(
-    model_name: str,
+def call_llm(
+    ai: str,
+    model: str,
     api_key: str,
     base_url: str,
     system_prompt: str,
     user_prompt: str,
+    # decrypt_direct_key: bool = False,
 ) -> LLMCallResult:
+    """Make one OpenAI-compatible provider call and normalize provider errors."""
+    from src.conversation.schemas import SUPPORTED_PROVIDERS
+
+    if (ai or "").lower() not in SUPPORTED_PROVIDERS:
+        raise ValueError(f"Unsupported AI provider: {ai}")
     if not api_key or not api_key.strip():
         raise InvalidDirectAPIKeyError("llm_api_key is required")
 
-    decrypted_api_key = api_key
+    # supplied_api_key = api_key
     if settings.API_KEY_ENCRYPTION_KEY:
         try:
-            decrypted_api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
+            api_key = decrypt_api_key(api_key, settings.API_KEY_ENCRYPTION_KEY)
         except Exception:
-            # Direct requests may provide either an encrypted or provider-native key.
-            decrypted_api_key = api_key
+            # Direct callers may supply a provider-native, unencrypted key.
+            api_key = api_key
 
     try:
-        return _call_openai_model(
-            api_key=decrypted_api_key,
-            base_url=base_url,
-            model_name=model_name,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        content = (
+            response.choices[0].message.content or ""
+        ).strip() if response.choices else ""
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        logger.info(
+            "LLM success provider=%s model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            ai,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+        return LLMCallResult(
+            content=content,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
     except Exception as exc:
         status_code = _status_code(exc)
         provider_message = _provider_error_message(exc)
-        for secret in (api_key, decrypted_api_key):
+        for secret in (api_key):
             if secret:
                 provider_message = provider_message.replace(secret, "[redacted]")
         message = {
-            400: "The provider rejected the request. Check llm and base_url.",
-            401: "The provider rejected llm_api_key. Check the API key and base_url.",
-            403: "Provider access was denied. Check llm_api_key permissions and llm access.",
-            404: "The requested model or endpoint is unavailable. Check llm and base_url.",
-            422: "The provider could not process the request. Check llm and request values.",
+            400: "The provider rejected the request. Check the model and base_url.",
+            401: "The provider rejected the API key. Check the key and base_url.",
+            403: "Provider access was denied. Check API key permissions and model access.",
+            404: "The requested model or endpoint is unavailable. Check the model and base_url.",
+            422: "The provider could not process the request. Check the model and request values.",
             429: "The provider rate limit or quota was exceeded. Try again later or check your quota.",
         }.get(status_code, "The LLM provider request failed.")
         if isinstance(exc, APITimeoutError):
@@ -285,13 +273,29 @@ def call_direct_model(
             message = "Could not connect to the provider. Check base_url and network connectivity."
         elif status_code is not None and status_code >= 500:
             message = "The provider encountered a server error. Try again later."
-        if status_code is not None:
-            raise ProviderRequestError(
-                f"Provider HTTP {status_code}: {provider_message}", message=message
-            ) from exc
+        detail = f"Provider HTTP {status_code}: {provider_message}" if status_code is not None else provider_message
         raise ProviderRequestError(
-            provider_message, message=message
+            detail,
+            message=message,
+            status_code=status_code,
+            response=getattr(exc, "response", None),
+            retryable=is_retryable_provider_error(exc),
         ) from exc
+
+
+def call_model(model: LLMFallbackModel, system_prompt: str, user_prompt: str) -> LLMCallResult:
+    if not settings.API_KEY_ENCRYPTION_KEY:
+        raise RuntimeError("API_KEY_ENCRYPTION_KEY is not configured")
+
+    api_key = decrypt_api_key(model.api_key, settings.API_KEY_ENCRYPTION_KEY)
+    return call_llm(
+        ai=model.provider,
+        model=model.llm_model,
+        api_key=api_key,
+        base_url=model.api_base_url,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
 
 
 def _provider_error_message(exc: Exception) -> str:
@@ -363,6 +367,8 @@ def is_auth_or_model_error(exc: Exception) -> bool:
 
 
 def is_retryable_provider_error(exc: Exception) -> bool:
+    if getattr(exc, "retryable", False):
+        return True
     code = _status_code(exc)
     if code is not None and (code >= 500 or code in {408, 409, 422, 498}):
         return True
