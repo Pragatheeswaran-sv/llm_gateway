@@ -21,6 +21,7 @@ from src.conversation.fallback import (
 import logging
 from uuid import UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.register_application.models import RegisterApplication
@@ -895,6 +896,7 @@ CLARIFICATION EXAMPLE (unclear request: "change it"; same schema state as above,
 
 BEFORE REPLYING CHECK: valid single JSON object with 4 keys only, no literal line breaks; correct intent; 5 summary sections in order separated by blank lines; Request Summary is a consolidated 2-4 bullet summary in your own words (not one line per request, not copied user wording); Refs after Tables in DBML; ALL existing ACTIVE refs kept plus new ones, in both dbml and Available References; non-SCHEMA dbml is ""; unclear/ambiguous/invalid request = dbml "" with a question in explanation and no change applied; explicit columns honored, otherwise relatable self-contained columns inferred with int/varchar types and no foreign-key or other-table reference columns unless the user asked; SCHEMA/RELATED explanation is 5 numbered lines; no duplicates of ACTIVE tables; state is consistent across dbml, summary and ledgers.
 """
+ 
 def generate_dbml_response(
     enable_summary: bool,
     summary: str,
@@ -1158,10 +1160,21 @@ def generate_dbml(
         for value in (direct_model, llm, llm_api_key, base_url)
     )
     if direct_values_supplied:
-        defaults = db.query(LLMFallbackModel).filter(
+        defaults_query = db.query(LLMFallbackModel).filter(
             LLMFallbackModel.is_active.is_(True),
             LLMFallbackModel.status == "ACTIVE",
-        ).order_by(LLMFallbackModel.priority.asc().nullslast(), LLMFallbackModel.id.asc()).first()
+        )
+        if direct_model:
+            defaults_query = defaults_query.filter(func.lower(LLMFallbackModel.provider) == direct_model.lower())
+        if llm:
+            defaults_query = defaults_query.filter(func.lower(LLMFallbackModel.llm_model) == llm.lower())
+
+        defaults = defaults_query.order_by(LLMFallbackModel.priority.asc().nullslast(), LLMFallbackModel.id.asc()).first()
+        if defaults is None and not (direct_model and llm and llm_api_key and base_url):
+            defaults = db.query(LLMFallbackModel).filter(
+                LLMFallbackModel.is_active.is_(True),
+                LLMFallbackModel.status == "ACTIVE",
+            ).order_by(LLMFallbackModel.priority.asc().nullslast(), LLMFallbackModel.id.asc()).first()
 
         provider = direct_model or (defaults.provider if defaults else None)
         model_name = llm or (defaults.llm_model if defaults else None)
@@ -1186,12 +1199,36 @@ def generate_dbml(
         if provider.lower() not in SUPPORTED_PROVIDERS:
             raise ValueError(f"Unsupported AI provider: {provider}")
 
+        # Check if the requested provider/model is already present in llm_fallback_models table
+        matched_fallback_model = None
+        if provider and model_name:
+            candidates_query = db.query(LLMFallbackModel).filter(
+                func.lower(LLMFallbackModel.provider) == provider.lower(),
+                func.lower(LLMFallbackModel.llm_model) == model_name.lower(),
+                LLMFallbackModel.is_active.is_(True),
+            )
+            all_matches = candidates_query.all()
+            if all_matches:
+                if resolved_api_key and settings.API_KEY_ENCRYPTION_KEY:
+                    for m in all_matches:
+                        try:
+                            dec = decrypt_api_key(m.api_key, settings.API_KEY_ENCRYPTION_KEY)
+                            if dec == resolved_api_key or m.api_key == resolved_api_key:
+                                matched_fallback_model = m
+                                break
+                        except Exception:
+                            if m.api_key == resolved_api_key:
+                                matched_fallback_model = m
+                                break
+                if matched_fallback_model is None:
+                    matched_fallback_model = all_matches[0]
+
         attempt = _start_attempt(
             db,
             request_id=request_id,
             provider=provider,
             model_name=model_name,
-            fallback_model=None,
+            fallback_model=matched_fallback_model,
             estimated_tokens=estimated_tokens,
         )
         call = None
@@ -1212,6 +1249,7 @@ def generate_dbml(
                 status="failed",
                 error_code="INVALID_API_KEY",
                 error_message=str(exc),
+                fallback_model=matched_fallback_model,
             )
             raise ValueError(str(exc)) from exc
         except Exception as exc:
@@ -1234,6 +1272,7 @@ def generate_dbml(
                     else "PROVIDER_ERROR"
                 ),
                 error_message=_logged_error(exc),
+                fallback_model=matched_fallback_model,
             )
             raise
         try:
@@ -1262,10 +1301,11 @@ def generate_dbml(
                     else None
                 ),
                 error_message=_logged_error(exc),
+                fallback_model=matched_fallback_model,
             )
             raise
         _record_request_dbml(db, request_id, result.get("dbml_query"))
-        _finish_attempt(db, attempt, status="success", call=call)
+        _finish_attempt(db, attempt, status="success", call=call, fallback_model=matched_fallback_model)
         if not enable_summary:
             result["updated_summary"] = None
         result["token_used"] = call.total_tokens
