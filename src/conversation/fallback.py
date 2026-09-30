@@ -266,9 +266,8 @@ def call_llm(
     except Exception as exc:
         status_code = _status_code(exc)
         provider_message = _provider_error_message(exc)
-        for secret in (api_key):
-            if secret:
-                provider_message = provider_message.replace(secret, "[redacted]")
+        if api_key and len(api_key) > 5:
+            provider_message = provider_message.replace(api_key, "[redacted]")
         message = {
             400: "The provider rejected the request. Check the model and base_url.",
             401: "The provider rejected the API key. Check the key and base_url.",
