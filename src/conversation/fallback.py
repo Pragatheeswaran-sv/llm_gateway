@@ -7,6 +7,7 @@ from openai import APIConnectionError, APITimeoutError, OpenAI
 from sqlalchemy import select, Sequence
 from sqlalchemy.orm import Session
 
+from src.database import Base
 from src.conversation.models import LLMFallbackModel
 from src.config import settings
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Reserve output capacity during the pre-call TPM/TPD check.
 DEFAULT_OUTPUT_TOKEN_RESERVE = 300
-ACCOUNT_TURN = Sequence("llm_fallback_account_turn", start=1)
+ACCOUNT_TURN = Sequence("llm_fallback_account_turn", metadata=Base.metadata, start=1)
 
 
 
@@ -25,7 +26,16 @@ def _next_account_turn(db: Session) -> int:
 
     Sequence increments survive rollback; a cancelled request may consume a turn.
     """
-    return db.scalar(select(ACCOUNT_TURN.next_value())) - 1
+    try:
+        return db.scalar(select(ACCOUNT_TURN.next_value())) - 1
+    except Exception:
+        db.rollback()
+        try:
+            ACCOUNT_TURN.create(db.get_bind(), checkfirst=True)
+            return db.scalar(select(ACCOUNT_TURN.next_value())) - 1
+        except Exception as exc:
+            logger.warning("Could not allocate next account turn from sequence: %s", exc)
+            return 0
 
 
 class NoAvailableLLMError(RuntimeError):
