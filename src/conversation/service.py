@@ -1038,12 +1038,27 @@ def _finish_request_log(
 ) -> None:
     from datetime import datetime, timezone
 
-    row.status = status
-    row.http_status_code = http_status_code
-    row.error_message = error_message
-    row.duration_ms = duration_ms
-    row.completed_at = datetime.now(timezone.utc)
-    db.commit()
+    try:
+        row.status = status
+        row.http_status_code = http_status_code
+        row.error_message = error_message
+        row.duration_ms = duration_ms
+        row.completed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            target = db.query(LLMRequestLog).filter(LLMRequestLog.id == row.id).first()
+            if target:
+                target.status = status
+                target.http_status_code = http_status_code
+                target.error_message = error_message
+                target.duration_ms = duration_ms
+                target.completed_at = datetime.now(timezone.utc)
+                db.commit()
+        except Exception as log_err:
+            logger.warning("Failed to record request log: %s", log_err)
+            db.rollback()
 
 
 def _finish_attempt(
@@ -1059,20 +1074,38 @@ def _finish_attempt(
 ) -> None:
     from datetime import datetime, timezone
 
-    row.status = status
-    row.http_status_code = http_status_code
-    row.error_code = error_code
-    row.error_message = error_message
-    row.completed_at = datetime.now(timezone.utc)
-    row.prompt_tokens = call.prompt_tokens if call else None
-    row.completion_tokens = call.completion_tokens if call else None
-    row.total_tokens = call.total_tokens if call else None
-    if fallback_model is not None:
-        row.used_tokens = fallback_model.used_tokens
-        row.used_requests = fallback_model.used_requests
-        row.minute_requests = fallback_model.minute_requests
-        row.minute_tokens = fallback_model.minute_tokens
-    db.commit()
+    try:
+        row.status = status
+        row.http_status_code = http_status_code
+        row.error_code = error_code
+        row.error_message = error_message
+        row.completed_at = datetime.now(timezone.utc)
+        row.prompt_tokens = call.prompt_tokens if call else None
+        row.completion_tokens = call.completion_tokens if call else None
+        row.total_tokens = call.total_tokens if call else None
+        if fallback_model is not None:
+            row.used_tokens = fallback_model.used_tokens
+            row.used_requests = fallback_model.used_requests
+            row.minute_requests = fallback_model.minute_requests
+            row.minute_tokens = fallback_model.minute_tokens
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            target = db.query(LLMRequestLog).filter(LLMRequestLog.id == row.id).first()
+            if target:
+                target.status = status
+                target.http_status_code = http_status_code
+                target.error_code = error_code
+                target.error_message = error_message
+                target.completed_at = datetime.now(timezone.utc)
+                target.prompt_tokens = call.prompt_tokens if call else None
+                target.completion_tokens = call.completion_tokens if call else None
+                target.total_tokens = call.total_tokens if call else None
+                db.commit()
+        except Exception as log_err:
+            logger.warning("Failed to record attempt log: %s", log_err)
+            db.rollback()
 
 
 def _exception_status_code(exc: Exception) -> int | None:
