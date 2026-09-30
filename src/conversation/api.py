@@ -27,7 +27,9 @@ router = APIRouter(prefix="/api/v1", tags=["DBML"])
 
 
 def _redact_secret(value: str, secret: str | None) -> str:
-    return value.replace(secret, "[redacted]") if secret else value
+    if secret and len(secret) > 5:
+        return value.replace(secret, "[redacted]")
+    return value
 
 
 @router.post("/generate", response_model=DBMLGenerateResponse)
@@ -38,6 +40,13 @@ def generate_dbml_endpoint(
 ):
     request_id = uuid4()
     started_at = perf_counter()
+
+    # Determine mode and user-requested values
+    direct_values_supplied = any(
+        value and value.strip()
+        for value in (request.model, request.llm, request.llm_api_key, request.base_url)
+    )
+
     user_prompt = build_user_prompt(
         enable_summary=request.enable_summary,
         summary=request.summary or "",
@@ -50,6 +59,7 @@ def generate_dbml_endpoint(
         user_prompt=user_prompt,
         summary_enabled=request.enable_summary,
         summary=request.summary,
+        is_fallback_mode=not direct_values_supplied,
     )
     response_status = status.HTTP_200_OK
     error_message = None
@@ -73,6 +83,7 @@ def generate_dbml_endpoint(
             llm_api_key=request.llm_api_key,
             base_url=request.base_url,
             request_id=request_id,
+            request_log=request_log,
         )
 
         return DBMLGenerateResponse(
@@ -112,12 +123,23 @@ def generate_dbml_endpoint(
         error_message = type(exc).__name__
         raise HTTPException(status_code=response_status, detail=str(exc)) from exc
     finally:
-        safe_error = _redact_secret(error_message or "", request.llm_api_key) or None
-        _finish_request_log(
-            db,
-            request_log,
-            status="request_success" if response_status < 400 else "request_failed",
-            http_status_code=response_status,
-            error_message=safe_error,
-            duration_ms=round((perf_counter() - started_at) * 1000),
-        )
+        total_duration = round((perf_counter() - started_at) * 1000)
+        if response_status >= 400:
+            safe_error = _redact_secret(error_message or "", request.llm_api_key) or None
+            _finish_request_log(
+                db,
+                request_log,
+                status="request_failed",
+                http_status_code=response_status,
+                error_message=safe_error,
+                duration_ms=total_duration,
+            )
+        else:
+            _finish_request_log(
+                db,
+                request_log,
+                status="success",
+                http_status_code=response_status,
+                duration_ms=total_duration,
+            )
+

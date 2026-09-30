@@ -13,6 +13,7 @@ from sqlalchemy import (
     Uuid,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
 from src.database import Base
 
@@ -63,16 +64,24 @@ class LLMFallbackModel(Base):
 
 
 class LLMRequestLog(Base):
-    """One row per selected or capacity-skipped fallback model."""
+    """Single row per API request.
+
+    Main columns capture the *successful* attempt (or final failure).
+    ``failed_attempts`` (JSONB) stores an array of failed/skipped attempt
+    objects so the full retry history is preserved without extra rows.
+    """
 
     __tablename__ = "llm_request_logs"
 
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     request_id = Column(Uuid(as_uuid=True), nullable=True, index=True)
+
+    # ── User request context ──
     user_prompt = Column(Text, nullable=True)
     dbml_query = Column(Text, nullable=True)
     summary_enabled = Column(Boolean, nullable=True)
     summary = Column(Text, nullable=True)
+    is_fallback_mode = Column(Boolean, nullable=False, default=False, server_default="false")
     duration_ms = Column(BigInteger, nullable=True)
     llm_fallback_model_id = Column(
         Uuid(as_uuid=True),
@@ -83,18 +92,19 @@ class LLMRequestLog(Base):
     provider = Column(String(100), nullable=False)
     model_name = Column(String(255), nullable=False)
     status = Column(String(40), nullable=False, default="started")
-    error_code = Column(String(40), nullable=True)
     http_status_code = Column(Integer, nullable=True)
     temperature = Column(Float, nullable=False, default=0.1)
-    estimated_tokens = Column(Integer, nullable=True)
     prompt_tokens = Column(BigInteger, nullable=True)
     completion_tokens = Column(BigInteger, nullable=True)
     total_tokens = Column(BigInteger, nullable=True)
-    used_tokens = Column(BigInteger, nullable=True)
-    used_requests = Column(Integer, nullable=True)
-    minute_requests = Column(Integer, nullable=True)
-    minute_tokens = Column(BigInteger, nullable=True)
     error_message = Column(Text, nullable=True)
+
+    # ── Attempt tracking ──
+    total_attempts = Column(Integer, nullable=False, default=1, server_default="1")
+    failed_attempts = Column(JSONB, nullable=True)
+
+    # ── Timing ──
+
     started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
