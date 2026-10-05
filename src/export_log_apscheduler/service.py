@@ -1,10 +1,8 @@
-import csv
-import gzip
 import io
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -16,148 +14,154 @@ from src.export_log_apscheduler.email import send_email_with_attachment
 logger = logging.getLogger(__name__)
 
 
-def        get_database_size_mb(db: Session) -> float:
-    """Return the total PostgreSQL database size in MB."""
-    try:
-        result = db.execute(text("SELECT pg_database_size(current_database())")).scalar()
-        if result is None:
-            return 0.0
-        return round(float(result) / (1024 * 1024), 2)
-    except Exception as exc:
-        logger.warning("Failed to check database size: %s", exc)
-        return 0.0
+def export_and_clean_logs(db: Session) -> dict:
+    """
+    Export the last EXPORT_INTERVAL_HOURS of logs to CSV, email it, then delete
+    the exported rows using a temp-table JOIN for safety.
 
+    Flow:
+      1. Query success/failed logs from the last 6 hours → DataFrame
+      2. Export DataFrame to CSV in-memory
+      3. Send email with CSV as attachment
+      4. Create a temp table (log_ids only) from the DataFrame
+      5. DELETE logs by JOIN on log_id between actual table and temp table
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=settings.EXPORT_INTERVAL_HOURS)
 
-def export_and_clean_logs(db: Session, force: bool = False) -> dict:
-    """Export old logs to a compressed CSV if DB size exceeds threshold, email to recipient, and delete."""
-    current_size_mb = get_database_size_mb(db)
-    logger.info(
-        "Checking DB Storage Size: %.2f MB (Threshold: %.2f MB)",
-        current_size_mb,
-        settings.DB_CLEANUP_THRESHOLD_MB,
-    )
+    logger.info("Fetching logs created after %s (last %d hours).", since.isoformat(), settings.EXPORT_INTERVAL_HOURS)
 
-    if not force and current_size_mb < settings.DB_CLEANUP_THRESHOLD_MB:
-        return {
-            "action": "skipped",
-            "reason": (
-                f"Database size ({current_size_mb:.2f} MB) is below "
-                f"threshold ({settings.DB_CLEANUP_THRESHOLD_MB:.2f} MB)"
-            ),
-            "current_size_mb": current_size_mb,
-        }
-
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=settings.LOG_RETENTION_DAYS)
-    logs_to_export = (
+    logs = (
         db.query(LLMRequestLog)
-        .filter(LLMRequestLog.created_at < cutoff_date)
+        .filter(LLMRequestLog.created_at >= since)
         .order_by(LLMRequestLog.created_at.asc())
         .all()
     )
 
-    if not logs_to_export:
-        logger.info(
-            "No logs older than %d days found to archive.",
-            settings.LOG_RETENTION_DAYS,
-        )
+    if not logs:
+        logger.info("No logs found in the last %d hours. Skipping export.", settings.EXPORT_INTERVAL_HOURS)
         return {
             "action": "skipped",
-            "reason": f"No request logs older than {settings.LOG_RETENTION_DAYS} days found to archive.",
-            "current_size_mb": current_size_mb,
+            "reason": f"No logs found in the last {settings.EXPORT_INTERVAL_HOURS} hours.",
+            "exported_rows": 0,
         }
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "id",
-        "request_id",
-        "provider",
-        "model_name",
-        "status",
-        "http_status_code",
-        "total_attempts",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "duration_ms",
-        "user_prompt",
-        "dbml_query",
-        "summary",
-        "is_fallback_mode",
-        "failed_attempts",
-        "started_at",
-        "completed_at",
-        "created_at",
-    ])
+    # ── Step 1: Build DataFrame ──────────────────────────────────────────────
+    records = []
+    for log in logs:
+        records.append({
+            "log_id": str(log.id),
+            "request_id": str(log.request_id) if log.request_id else "",
+            "provider": log.provider or "",
+            "model_name": log.model_name or "",
+            "status": log.status or "",
+            "http_status_code": log.http_status_code or "",
+            "total_attempts": log.total_attempts or 1,
+            "prompt_tokens": log.prompt_tokens or "",
+            "completion_tokens": log.completion_tokens or "",
+            "total_tokens": log.total_tokens or "",
+            "duration_ms": log.duration_ms or "",
+            "user_prompt": log.user_prompt or "",
+            "dbml_query": log.dbml_query or "",
+            "summary": log.summary or "",
+            "is_fallback_mode": log.is_fallback_mode,
+            "failed_attempts": str(log.failed_attempts) if log.failed_attempts else "",
+            "started_at": log.started_at.isoformat() if log.started_at else "",
+            "completed_at": log.completed_at.isoformat() if log.completed_at else "",
+            "created_at": log.created_at.isoformat() if log.created_at else "",
+        })
 
-    log_ids = []
-    for log in logs_to_export:
-        log_ids.append(log.id)
-        writer.writerow([
-            str(log.id),
-            str(log.request_id) if log.request_id else "",
-            log.provider or "",
-            log.model_name or "",
-            log.status or "",
-            log.http_status_code or "",
-            log.total_attempts or 1,
-            log.prompt_tokens or "",
-            log.completion_tokens or "",
-            log.total_tokens or "",
-            log.duration_ms or "",
-            log.user_prompt or "",
-            log.dbml_query or "",
-            log.summary or "",
-            log.is_fallback_mode,
-            json.dumps(log.failed_attempts) if log.failed_attempts else "",
-            log.started_at.isoformat() if log.started_at else "",
-            log.completed_at.isoformat() if log.completed_at else "",
-            log.created_at.isoformat() if log.created_at else "",
-        ])
+    df = pd.DataFrame(records)
+    logger.info("Built DataFrame with %d rows.", len(df))
 
-    csv_data = output.getvalue().encode("utf-8")
-    compressed_data = gzip.compress(csv_data)
+    # ── Step 2: Export DataFrame → CSV (in-memory) ──────────────────────────
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+
     filename = (
-        f"llm_request_logs_archive_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv.gz"
+        f"llm_request_logs_{since.strftime('%Y%m%d_%H%M%S')}"
+        f"_to_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     )
 
-    subject = f"[Database Alert] LLM Gateway Storage Export ({len(logs_to_export)} logs archived)"
+    # ── Step 3: Send email with CSV as attachment ────────────────────────────
+    subject = f"[LLM Gateway] Log Export – {len(df)} records ({since.strftime('%Y-%m-%d %H:%M')} UTC)"
     body = (
-        f"LLM Gateway Storage Cleanup Report\n"
+        f"LLM Gateway – Scheduled Log Export\n"
         f"-------------------------------------\n"
-        f"Recipient: {settings.ALERT_EMAIL_RECIPIENT}\n"
-        f"Database Size Before Cleanup: {current_size_mb:.2f} MB\n"
-        f"Archived Rows Count: {len(logs_to_export)}\n"
-        f"Log Retention Period: {settings.LOG_RETENTION_DAYS} days\n"
-        f"Exported File: {filename}\n\n"
-        f"The exported log archive is attached as a compressed .csv.gz file.\n"
+        f"Export Window : Last {settings.EXPORT_INTERVAL_HOURS} hours\n"
+        f"From          : {since.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+        f"To            : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+        f"Exported Rows : {len(df)}\n"
+        f"File          : {filename}\n\n"
+        f"The exported log file is attached as a CSV."
     )
 
-    send_email_with_attachment(
+    email_sent = send_email_with_attachment(
         recipient=settings.ALERT_EMAIL_RECIPIENT,
         subject=subject,
         body=body,
-        attachment_bytes=compressed_data,
+        attachment_bytes=csv_bytes,
         filename=filename,
     )
 
-    # Delete exported rows
-    db.query(LLMRequestLog).filter(LLMRequestLog.id.in_(log_ids)).delete(synchronize_session=False)
-    db.commit()
+    if not email_sent:
+        logger.error("Email sending failed. Skipping delete to prevent data loss.")
+        return {
+            "action": "failed",
+            "reason": "Email could not be sent. Rows were NOT deleted.",
+            "exported_rows": len(df),
+        }
 
-    # Reclaim disk space
+    logger.info("Email sent successfully. Proceeding to delete exported rows.")
+
+    # ── Step 4: Create temp table with log_ids from DataFrame ────────────────
+    log_ids = df["log_id"].tolist()
+
     try:
+        with engine.connect() as conn:
+            with conn.begin():
+                # Create temp table for this session
+                conn.execute(text("""
+                    CREATE TEMP TABLE IF NOT EXISTS temp_export_log_ids (
+                        log_id UUID PRIMARY KEY
+                    ) ON COMMIT DROP
+                """))
+
+                # Bulk-insert the log_ids into the temp table
+                conn.execute(
+                    text("INSERT INTO temp_export_log_ids (log_id) VALUES (:log_id)"),
+                    [{"log_id": lid} for lid in log_ids],
+                )
+
+                # ── Step 5: DELETE using JOIN with temp table ────────────────
+                delete_result = conn.execute(text("""
+                    DELETE FROM llm_request_logs l
+                    USING temp_export_log_ids t
+                    WHERE l.id = t.log_id::uuid
+                """))
+
+                deleted_count = delete_result.rowcount
+                logger.info("Deleted %d rows via temp-table JOIN.", deleted_count)
+
+        # Reclaim disk space (runs outside the transaction)
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text("VACUUM ANALYZE llm_request_logs;"))
-    except Exception as vacuum_err:
-        logger.warning("Vacuum failed: %s", vacuum_err)
+            logger.info("VACUUM ANALYZE completed.")
 
-    new_size_mb = get_database_size_mb(db)
-    logger.info("Cleanup completed. New DB Size: %.2f MB", new_size_mb)
+    except Exception as exc:
+        logger.exception("Error during delete/vacuum step: %s", exc)
+        return {
+            "action": "partial",
+            "reason": f"Email sent but delete failed: {exc}",
+            "exported_rows": len(df),
+            "deleted_rows": 0,
+        }
 
     return {
         "action": "completed",
-        "archived_rows": len(logs_to_export),
-        "previous_size_mb": current_size_mb,
-        "new_size_mb": new_size_mb,
+        "export_window_hours": EXPORT_INTERVAL_HOURS,
+        "since": since.isoformat(),
+        "exported_rows": len(df),
+        "deleted_rows": deleted_count,
+        "file": filename,
     }

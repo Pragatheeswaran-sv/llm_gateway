@@ -1,5 +1,8 @@
 import logging
+
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from src.config import settings
 from src.database import SessionLocal
 from src.export_log_apscheduler.service import export_and_clean_logs
 
@@ -9,14 +12,14 @@ scheduler = BackgroundScheduler()
 
 
 def run_scheduled_export_job():
-    """Periodically check database size and run log export/cleanup if threshold reached."""
-    logger.info("Executing scheduled DB size check & export job...")
+    """Export & delete the last N hours of logs on every scheduler tick."""
+    logger.info("Running scheduled log export job (last %d hours)...", settings.EXPORT_INTERVAL_HOURS)
     db = SessionLocal()
     try:
-        result = export_and_clean_logs(db, force=False)
-        logger.info("Scheduled DB export job finished: %s", result)
+        result = export_and_clean_logs(db)
+        logger.info("Scheduled export job finished: %s", result)
     except Exception as exc:
-        logger.exception("Error executing DB export job: %s", exc)
+        logger.exception("Error in scheduled export job: %s", exc)
     finally:
         db.close()
 
@@ -24,20 +27,26 @@ def run_scheduled_export_job():
 def start_scheduler():
     """Initialize and start the background APScheduler."""
     if not scheduler.running:
-        # Run every 6 hours
         scheduler.add_job(
             run_scheduled_export_job,
             "interval",
-            hours=6,
-            id="db_log_export_job",
+            hours=settings.EXPORT_INTERVAL_HOURS,
+            id="log_export_job",
             replace_existing=True,
         )
         scheduler.start()
-        logger.info("APScheduler started: Monitoring DB size every 6 hours.")
+        logger.info("APScheduler started: exporting logs every %d hours.", settings.EXPORT_INTERVAL_HOURS)
 
 
 def shutdown_scheduler():
-    """Shutdown APScheduler background process."""
+    """Shutdown the APScheduler background process."""
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("APScheduler shutdown completed.")
+
+
+def shutdown_scheduler():
+    """Shutdown the APScheduler background process."""
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("APScheduler shutdown completed.")

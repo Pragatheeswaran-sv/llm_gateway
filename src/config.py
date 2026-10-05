@@ -21,12 +21,12 @@ class Settings:
 
     # Export & Email Scheduler Settings
     ALERT_EMAIL_RECIPIENT = os.getenv("ALERT_EMAIL_RECIPIENT", "kesavan.t@mitrahsoft.in")
+    EXPORT_INTERVAL_HOURS = int(os.getenv("EXPORT_INTERVAL_HOURS", "6"))
     SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
     SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
     SMTP_USER = os.getenv("SMTP_USER", "")
     SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-    DB_CLEANUP_THRESHOLD_MB = float(os.getenv("DB_CLEANUP_THRESHOLD_MB", "400.0"))
-    LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
+
 
 
 settings = Settings()
