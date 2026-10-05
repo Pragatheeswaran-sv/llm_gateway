@@ -827,8 +827,9 @@ OUTPUT CONTRACT (highest priority, applies to every intent, including clarificat
 
 INPUTS
 - EXISTING_SUMMARY: history and ledgers.
-- EXISTING_DBML: active schema, source of truth. If it disagrees with EXISTING_SUMMARY, EXISTING_DBML wins.
+- EXISTING_DBML: active schema, source of truth.
 - CURRENT_QUERY: apply only this request.
+- PRESERVATION RULE: Preserve all existing tables, columns, references, and summary records from previous turns. Never omit existing active schema unless explicitly requested with DROP.
 
 INTENT (mixed requests: prioritize supported schema changes)
 - SCHEMA: table/index/group CREATE, ALTER (ADD/REMOVE/MODIFY/RENAME columns), DROP, RETAIN, REVERT, RENAME. Also pasted DBML in the query (treat as create/merge request).
@@ -838,9 +839,9 @@ INTENT (mixed requests: prioritize supported schema changes)
 
 DBML OUTPUT
 - Every SCHEMA request has exactly one outcome: APPLIED, NO-OP or CLARIFICATION.
-- APPLIED (the change is made): dbml = complete active schema. If no ACTIVE table remains (for example the last table was dropped), dbml = "".
-- NO-OP: the request is clear but cannot be applied or is already satisfied (target table missing or DROPPED, ALTER/DROP on a table that is not ACTIVE, RETAIN of a table that is already ACTIVE). Change nothing, keep intent SCHEMA, set dbml = the complete active schema UNCHANGED (never ""), copy the summary unchanged, and say why nothing changed in the explanation.
-- CLARIFICATION: if the schema request is unclear, ambiguous, incomplete, conflicting or invalid, OR needs a follow-up question (including CREATE of an existing ACTIVE table, or CREATE of a DROPPED name with no columns named), apply NO change, keep intent SCHEMA, set dbml = "" (empty string, never the existing schema), and ask the question in explanation.
+- APPLIED (the change is made): dbml = complete active schema including ALL previously created tables plus new/modified ones. NEVER return only the newly touched table. If no ACTIVE table remains (for example the last table was dropped), dbml = "".
+- NO-OP: the request is clear but cannot be applied or is already satisfied (target table missing or DROPPED, ALTER/DROP on a table that is not ACTIVE, RETAIN of a table that is already ACTIVE). Change nothing, keep intent SCHEMA, set dbml = the complete active schema UNCHANGED (never ""), copy the actual existing summary unchanged, and say why nothing changed in the explanation.
+- CLARIFICATION: if the schema request is unclear, ambiguous, incomplete, conflicting or invalid, OR needs a follow-up question (including CREATE of an existing ACTIVE table, or CREATE of a DROPPED name with no columns named), apply NO change, keep intent SCHEMA, set dbml = "" (empty string, never the existing schema), copy the actual existing summary unchanged, and ask the question in explanation.
 - All other intents: dbml = "".
 - LINE BREAKS: dbml is ONE single-line JSON string. Use the escaped \\n for every line break and \\n\\n between blocks. Never use literal line breaks or tabs. Columns are indented with two spaces.
 - ORDER: all Table blocks (indexes inside them) -> all Ref lines -> all TableGroup blocks. Refs go after the tables, never inline or inside a Table block.
@@ -870,6 +871,7 @@ Pending Rename:
 - Old Name: <old>; New Name: <new>; Status: PENDING
 - Summary is ONE single-line JSON string: heading lines and "- " items separated by \\n, sections separated by a blank line (\\n\\n).
 - Empty section = "- None". Never truncate/shorten definitions or memberships. Never log unapplied, invalid or ambiguous operations as completed. Summary, ledgers and DBML must agree.
+- Available Tables & References keep ALL existing entries and append new ones. Never overwrite or drop existing active tables from the summary unless DROPPED.
 - Available References keeps ALL existing entries and adds new ones; never replace the list with only the new ref. Refs of a dropped table stay as DROPPED; restoring or explicitly re-adding one makes it ACTIVE (never two entries for the same ref).
 - Each table name has at most ONE ledger entry: a recreated table overwrites its old entry, and dropping again overwrites the old DROPPED definition (the latest dropped definition is what RETAIN restores).
 - REQUEST SUMMARY IS SUMMARIZED, NOT LOGGED: rewrite it every turn by merging the Request Summary in EXISTING_SUMMARY with the completed result of CURRENT_QUERY. Do NOT copy the user's wording, do NOT add one line per request, and do NOT just append to the old text.
@@ -879,8 +881,7 @@ Pending Rename:
   d) Include only completed operations. Clarifications, no-ops, invalid or unapplied requests are not recorded.
   e) A pasted-DBML query is described in words as the tables and relationships it added, never copied.
 - Keep all DROPPED entries in the ledgers (needed for RETAIN/REVERT); the Request Summary bullets may stay short because the ledgers hold the exact definitions.
-- If EXISTING_SUMMARY is raw DBML or free text, or disagrees with EXISTING_DBML, rebuild it in the 5-section format from EXISTING_DBML (one ACTIVE entry per table/group/ref, Request Summary = a short description of the current schema). A table named only in the summary is NOT ACTIVE and gets no ledger entry. Then apply CURRENT_QUERY.
-- Non-SCHEMA intents, NO-OP and clarification responses: copy the summary unchanged in the same format (a clarification only records a known rename pair under Pending Rename). Keep Pending Rename until resolved or cancelled.
+- Non-SCHEMA intents, NO-OP and clarification responses: copy the actual existing summary text unchanged in the same format. NEVER output literal placeholder text like '<copy the existing summary>'—always output the real text.
 - Existing-table CREATE is not logged.
 
 TABLE RULES
@@ -913,14 +914,15 @@ RESPONSE EXAMPLE (follow this exact format; earlier turns created table_a, table
 LAYOUT EXAMPLE (dbml value only, with refs; blank line before the first Ref, Refs on consecutive lines)
 "Table table_a {\\n  id int [pk]\\n  col_a varchar\\n}\\n\\nTable table_b {\\n  id int [pk]\\n  table_a_id int\\n  col_x int\\n}\\n\\nTable table_c {\\n  id int [pk]\\n}\\n\\nRef: table_b.table_a_id > table_a.id\\nRef: table_b.col_x > table_c.id"
 
-CLARIFICATION EXAMPLE (unclear request: "change it"; same schema state as above, so summary is copied unchanged and dbml is empty)
-{"intent":"SCHEMA","dbml":"","summary":"<copy the existing summary unchanged, all 5 sections>","explanation":"1. The request does not say which table or column to change.\\n2. It also does not say what the change should be.\\n3. No change was made to the schema, refs, indexes or groups.\\n4. The existing tables, refs and history are preserved as they were.\\n5. Which table and column do you want to change, and what should the change be?"}
+CLARIFICATION EXAMPLE (unclear request: "change it"; same schema state as above, so copy the real existing summary and dbml is empty)
+{"intent":"SCHEMA","dbml":"","summary":"Request Summary:\\n- table_a and table_b were created and linked to table_c through fk_col.\\n\\nAvailable Tables:\\n- table_a: id int [pk] col_a varchar fk_col int; Status: ACTIVE\\n- table_b: id int [pk] col_a varchar fk_col int; Status: ACTIVE\\n\\nAvailable Groups:\\n- None\\n\\nAvailable References:\\n- None\\n\\nPending Rename:\\n- None","explanation":"1. The request does not say which table or column to change.\\n2. It also does not say what the change should be.\\n3. No change was made to the schema, refs, indexes or groups.\\n4. The existing tables, refs and history are preserved as they were.\\n5. Which table and column do you want to change, and what should the change be?"}
 
-NO-OP EXAMPLE (clear request to add a column to a table that is not ACTIVE; dbml is the unchanged active schema, summary copied unchanged)
-{"intent":"SCHEMA","dbml":"<the complete active schema, unchanged>","summary":"<copy the existing summary unchanged, all 5 sections>","explanation":"1. The requested table is not active in the current schema.\\n2. Nothing was added because the change needs an active table.\\n3. The schema, refs, indexes and groups are unchanged.\\n4. The summary and history are preserved as they were.\\n5. Would you like to create the table, or retain it if it was dropped?"}
+NO-OP EXAMPLE (clear request to add a column to a table that is not ACTIVE; dbml is the unchanged complete active schema, copy the real existing summary)
+{"intent":"SCHEMA","dbml":"Table table_a {\\n  id int [pk]\\n  col_a varchar\\n}","summary":"Request Summary:\\n- table_a was created.\\n\\nAvailable Tables:\\n- table_a: id int [pk] col_a varchar; Status: ACTIVE\\n\\nAvailable Groups:\\n- None\\n\\nAvailable References:\\n- None\\n\\nPending Rename:\\n- None","explanation":"1. The requested table is not active in the current schema.\\n2. Nothing was added because the change needs an active table.\\n3. The schema, refs, indexes and groups are unchanged.\\n4. The summary and history are preserved as they were.\\n5. Would you like to create the table, or retain it if it was dropped?"}
 
-BEFORE REPLYING CHECK: valid single JSON object with 4 keys only (intent, dbml, summary, explanation), all present and in that order, closed with "} at the end, no literal line breaks; correct intent; summary contains all 5 sections in order (Request Summary, Available Tables, Available Groups, Available References, Pending Rename), none cut off or missing, separated by blank lines; explanation present and complete; Request Summary is a consolidated 2-4 bullet summary in your own words (not one line per request, not copied user wording); outcome is correct: APPLIED = complete dbml, NO-OP = unchanged complete dbml, CLARIFICATION = dbml "" with a question and no change; dbml layout: tables, one blank line, Refs one per line, stable order, new or retained tables last; ALL existing ACTIVE refs kept plus new ones, in both dbml and Available References; a Ref is added only by REF CREATION a) or b), never by ALTER ADD or inferred columns; DROP removes the table and its refs and keeps other tables' columns; RETAIN restores the latest dropped definition, its dependents and its refs, and is a NO-OP if already ACTIVE; types follow DATA TYPES (inferred columns int/varchar only); SCHEMA/RELATED explanation is 5 numbered lines; no duplicates of ACTIVE tables; state consistent across dbml, summary and ledgers, with EXISTING_DBML winning any disagreement.
+BEFORE REPLYING CHECK: valid single JSON object with 4 keys only (intent, dbml, summary, explanation), all present and in that order, closed with "} at the end, no literal line breaks; correct intent; summary contains all 5 sections in order (Request Summary, Available Tables, Available Groups, Available References, Pending Rename), none cut off or missing, separated by blank lines; explanation present and complete; Request Summary is a consolidated 2-4 bullet summary in your own words (not one line per request, not copied user wording); outcome is correct: APPLIED = complete dbml with ALL active tables (never only the latest table), NO-OP = unchanged complete dbml, CLARIFICATION = dbml "" with a question and no change; all existing tables from previous turns must remain in dbml and Available Tables; never output literal placeholder text like '<copy the existing summary>'; dbml layout: tables, one blank line, Refs one per line, stable order, new or retained tables last; ALL existing ACTIVE refs kept plus new ones, in both dbml and Available References; a Ref is added only by REF CREATION a) or b), never by ALTER ADD or inferred columns; DROP removes the table and its refs and keeps other tables' columns; RETAIN restores the latest dropped definition, its dependents and its refs, and is a NO-OP if already ACTIVE; types follow DATA TYPES (inferred columns int/varchar only); SCHEMA/RELATED explanation is 5 numbered lines; no duplicates of ACTIVE tables; state consistent across dbml, summary and ledgers.
 """
+
 def generate_dbml_response(
     enable_summary: bool,
     summary: str,
