@@ -21,8 +21,7 @@ from src.conversation.service import (
     validate_access_token,
 )
 from src.database import get_db
-
-
+from src.utils.errors import get_user_friendly_error
 router = APIRouter(prefix="/api/v1", tags=["DBML"])
 
 
@@ -97,31 +96,32 @@ def generate_dbml_endpoint(
         error_message = str(exc)
         raise HTTPException(
             status_code=response_status,
-            detail=str(exc),
+            detail=get_user_friendly_error(exc),
         ) from exc
     except ProviderRequestError as exc:
         response_status = status.HTTP_502_BAD_GATEWAY
         error_message = f"{exc.message} {exc}"
         raise HTTPException(
             status_code=response_status,
-            detail=error_message,
+            detail=get_user_friendly_error(exc),
         ) from exc
     except InvalidDirectAPIKeyError as exc:
         response_status = status.HTTP_400_BAD_REQUEST
         error_message = str(exc)
-        raise HTTPException(status_code=response_status, detail=error_message) from exc
+        raise HTTPException(status_code=response_status, detail=get_user_friendly_error(exc)) from exc
     except ValueError as exc:
         response_status = status.HTTP_401_UNAUTHORIZED if "access token" in str(exc).lower() else status.HTTP_400_BAD_REQUEST
         error_message = _redact_secret(str(exc), request.llm_api_key)
-        raise HTTPException(status_code=response_status, detail=error_message) from exc
+        detail_msg = error_message if "access token" in str(exc).lower() else get_user_friendly_error(exc)
+        raise HTTPException(status_code=response_status, detail=detail_msg) from exc
     except HTTPException as exc:
         response_status = exc.status_code
         error_message = _redact_secret(str(exc.detail), request.llm_api_key)
         raise
     except Exception as exc:
         response_status = status.HTTP_500_INTERNAL_SERVER_ERROR
-        error_message = type(exc).__name__
-        raise HTTPException(status_code=response_status, detail=str(exc)) from exc
+        error_message = str(exc)
+        raise HTTPException(status_code=response_status, detail=get_user_friendly_error(exc)) from exc
     finally:
         total_duration = round((perf_counter() - started_at) * 1000)
         if response_status >= 400:

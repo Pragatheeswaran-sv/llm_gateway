@@ -13,6 +13,7 @@ from src.vision_service.schemas import VisionGenerateRequest, VisionGenerateResp
 from src.vision_service.service import generate_dbml_from_file
 from src.config import settings
 from src.utils.helper import decrypt_api_key
+from src.utils.errors import get_user_friendly_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
@@ -82,4 +83,5 @@ def generate_from_file_api(
         db.add(log_entry)
         db.commit()
         
-        raise HTTPException(status_code=500, detail=str(e))
+        user_message = get_user_friendly_error(e)
+        raise HTTPException(status_code=500, detail=user_message)
