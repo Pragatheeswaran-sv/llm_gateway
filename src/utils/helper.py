@@ -9,8 +9,11 @@ from datetime import datetime, timedelta, timezone
 import os
 import base64
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import logging
 
 from src.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class AccessTokenError(ValueError):
@@ -103,7 +106,7 @@ def parse_dbml_response(
         if not all(
             isinstance(value, str) for value in (dbml, summary, explanation, intent)
         ):
-            print(f"Invalid DBML response format from LLM from not all parse_dbml_response values are strings: {payload}")
+            logger.warning(f"Invalid DBML response format from LLM from not all parse_dbml_response values are strings: {payload}")
             raise ValueError("Invalid DBML response format from LLM.")
 
         if intent not in VALID_LLM_INTENTS:
@@ -117,13 +120,13 @@ def parse_dbml_response(
             "updated_summary": flatten_llm_text(summary).strip(),
             "explanation": flatten_llm_text(explanation),
         }
-        print(f"parse_dbml_response result: {result}")
+        logger.debug(f"parse_dbml_response result: {result}")
         if include_intent:
             result["intent"] = intent
         return result
 
     if "```" in response:
-        print(f"Invalid DBML response format from LLM '\\n': {response}")
+        logger.warning(f"Invalid DBML response format from LLM '\\n': {response}")
         raise ValueError("Invalid DBML response format from LLM.")
 
     match = re.fullmatch(
@@ -133,9 +136,9 @@ def parse_dbml_response(
         response,
         flags=re.DOTALL,
     )
-    print(f"match+response: {match}{response}")
+    logger.debug(f"match+response: {match}{response}")
     if not match:
-        print(f"Invalid DBML response format from LLM match : {response}{match}")
+        logger.warning(f"Invalid DBML response format from LLM match : {response}{match}")
         raise ValueError("Invalid DBML response format from LLM.")
 
     dbml = match.group("dbml").strip()
