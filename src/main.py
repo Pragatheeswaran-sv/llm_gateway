@@ -10,6 +10,11 @@ from src.database import Base, engine
 from src.conversation.api import router as conversation_router
 from src.register_application.api import router as application_router
 from src.vision_service.api import router as vision_router
+from src.export_log_apscheduler import (
+    export_logs_router,
+    shutdown_scheduler,
+    start_scheduler,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +29,18 @@ async def lifespan(app: FastAPI):
         logging.info("Database tables verified/created successfully.")
     except Exception as e:
         logging.error(f"Failed to create database tables: {e}")
+
+    try:
+        start_scheduler()
+    except Exception as e:
+        logging.error(f"Failed to start APScheduler: {e}")
+
     yield
+
+    try:
+        shutdown_scheduler()
+    except Exception as e:
+        logging.error(f"Failed to shutdown APScheduler: {e}")
 
 
 app = FastAPI(
@@ -35,6 +51,7 @@ app = FastAPI(
 app.include_router(application_router)
 app.include_router(conversation_router)
 app.include_router(vision_router)
+app.include_router(export_logs_router)
 
 
 def _json_safe(value):
