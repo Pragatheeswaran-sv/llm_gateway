@@ -159,7 +159,7 @@ def export_and_clean_logs(db: Session) -> dict:
 
     return {
         "action": "completed",
-        "export_window_hours": EXPORT_INTERVAL_HOURS,
+        "export_window_hours": settings.EXPORT_INTERVAL_HOURS,
         "since": since.isoformat(),
         "exported_rows": len(df),
         "deleted_rows": deleted_count,
