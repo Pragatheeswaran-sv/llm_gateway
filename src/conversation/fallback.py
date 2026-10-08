@@ -410,3 +410,22 @@ def record_unavailable(db: Session, model: LLMFallbackModel, reason: str) -> Non
     model.last_used_at = utcnow()
     db.commit()
     logger.warning("Model marked unavailable model=%s reason=%s", model.llm_model, reason)
+
+
+def _exception_status_code(exc: Exception) -> int | None:
+    status_code = _status_code(exc)
+    if status_code is not None:
+        return status_code
+    import re
+    match = re.search(r"Provider HTTP (\d{3})", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _logged_error(exc: Exception) -> str:
+    code = _exception_status_code(exc)
+    suffix = f" (HTTP {code})" if code is not None else ""
+    detail = str(exc) if isinstance(exc, ProviderRequestError) else _provider_error_message(exc)
+    detail = str(detail).strip()
+    if len(detail) > 1000:
+        detail = detail[:997] + "..."
+    return f"{type(exc).__name__}{suffix}: {detail}" if detail else f"{type(exc).__name__}{suffix}"
