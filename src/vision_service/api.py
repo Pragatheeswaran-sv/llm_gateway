@@ -1,6 +1,9 @@
 import logging
 import time
 import uuid
+import base64
+import io
+from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -44,6 +47,32 @@ def generate_from_file_api(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid API key.")
 
+    # Image Resolution Validation (Skip for PDFs)
+    is_image = False
+    if request.file_base64.startswith("data:image/"):
+        is_image = True
+    elif request.file_name and request.file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+        is_image = True
+
+    if is_image:
+        b64_str = request.file_base64
+        if "," in b64_str:
+            b64_str = b64_str.split(",")[1]
+            
+        try:
+            image_data = base64.b64decode(b64_str)
+            with Image.open(io.BytesIO(image_data)) as img:
+                width, height = img.size
+                if width < 800 or height < 600:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Image resolution too low ({width}x{height}). Please upload a clearer image of at least 800x600 pixels to prevent data hallucinations."
+                    )
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=400, detail="Invalid image format.")
+
     try:
         dbml_query, token_used = generate_dbml_from_file(
             file_base64=request.file_base64,
@@ -52,6 +81,8 @@ def generate_from_file_api(
             llm_api_key=resolved_api_key,
             base_url=request.base_url
         )
+        
+        logger.info(f"Vision DBML generated successfully | Model: {request.llm} | Tokens used: {token_used}")
         
         return VisionGenerateResponse(
             message="DBML generated successfully",

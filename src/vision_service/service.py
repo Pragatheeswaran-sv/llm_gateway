@@ -21,8 +21,12 @@ Pay extreme attention to the following STRICT RULES:
 5. Translating Relationships (Crucial Rule):
    - 1-to-Many (1:N) & 1-to-1: NEVER create a separate table for these relationships (even if the diagram has a label or diamond like "BelongsTo"). Instead, represent them simply as a foreign key inside the child table.
    - Many-to-Many (N:M): ONLY create a new junction table if the relationship is strictly Many-to-Many (e.g., "Follows" between Users).
-6. Do not guess or invent tables that are not implied by the image.
-7. Multiple Diagrams: If the document contains multiple independent schemas, you must prevent duplicate table names by prefixing the tables with a short diagram identifier (e.g., `Hospital_Department` and `Employee_Department`). NEVER invent relationships between tables that belong to different, unrelated diagrams. Additionally, you MUST create a `TableGroup` block at the end of the file for each schema to visually group their respective tables together (e.g., `TableGroup HospitalSystem { Hospital_Patient ... }`).
+6. DO NOT GUESS (CRITICAL): Read the actual facts from the image. Do not invent tables, relationships, or groups that are not explicitly drawn.
+7. TableGroups & Multiple Diagrams: 
+   - If there are completely separate systems (e.g., multi-page PDFs), prefix table names to avoid duplicates and create a `TableGroup` for each system.
+   - For a single image: Group tables connected by lines into a logical `TableGroup`. However, if there are any loose, disconnected tables without relationship lines, you MUST put ALL of them into a single `TableGroup Unlinked`. DO NOT guess grouping based on visual proximity; rely strictly on actual relationship lines.
+   - CRITICAL SYNTAX: NEVER nest `Table` definitions inside a `TableGroup`. Tables must ALWAYS be top-level. The `TableGroup` block goes at the very bottom of the file and ONLY contains the names of the tables (e.g., `TableGroup MyGroup { Table1 \n Table2 }`).
+8. OCR Precision (CRITICAL): The text in the diagram may be small or compressed. You must read every table name, column name, and data type letter-by-letter. Do not guess, skip, or hallucinate words. Extract the text exactly as it appears (e.g., if a table is named `customer_id`, do not invent `CustomersAd`).
 
 OUTPUT FORMAT:
 Return ONLY the raw DBML code. Do not wrap it in markdown blockquotes (```dbml ... ```). Do not provide any explanations, summaries, or conversational text. Your entire response must be valid, strict, parseable DBML."""
@@ -101,7 +105,7 @@ def generate_dbml_from_file(
             if getattr(block, "type", "") == "text" and isinstance(text, str):
                 output_text += text
                 
-        print(f"DEBUG: Extracted raw text: {output_text}")
+        # print(f"DEBUG: Extracted raw text: {output_text}")
         
         # Strip markdown code blocks if the model ignored instructions
         output_text = output_text.strip()

@@ -8,7 +8,7 @@ def get_user_friendly_error(exc: Exception) -> str:
         return "Authentication failed. Please check your provided API key and try again."
     if "413" in exc_str or "too large" in exc_str:
         return "The provided request is too large. Please reduce the size of your input."
-    if "invalid dbml" in exc_str:
+    if "invalid dbml" in exc_str or "invalid llm intent" in exc_str:
         return "The AI model returned an unexpected or invalid response. Please try rephrasing your request."
     if "unsupported ai provider" in exc_str:
         return "The requested AI provider is not supported. Please check your model settings and try again."
