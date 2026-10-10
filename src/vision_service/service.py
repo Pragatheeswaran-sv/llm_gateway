@@ -1,6 +1,7 @@
 import logging
 import httpx
 from anthropic import Anthropic
+from openai import OpenAI
 from src.vision_service.file_optimizer import process_file_base64
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ Pay extreme attention to the following STRICT RULES:
    - For a single image: Group tables connected by lines into a logical `TableGroup`. However, if there are any loose, disconnected tables without relationship lines, you MUST put ALL of them into a single `TableGroup Unlinked`. DO NOT guess grouping based on visual proximity; rely strictly on actual relationship lines.
    - CRITICAL SYNTAX: NEVER nest `Table` definitions inside a `TableGroup`. Tables must ALWAYS be top-level. The `TableGroup` block goes at the very bottom of the file and ONLY contains the names of the tables (e.g., `TableGroup MyGroup { Table1 \n Table2 }`).
 8. OCR Precision (CRITICAL): The text in the diagram may be small or compressed. You must read every table name, column name, and data type letter-by-letter. Do not guess, skip, or hallucinate words. Extract the text exactly as it appears (e.g., if a table is named `customer_id`, do not invent `CustomersAd`).
+9. INVALID / IRRELEVANT IMAGES (CRITICAL): If the image provided is clearly NOT a database schema or ER diagram (e.g., if it is a random photo, pop-culture image, blank white image, or an unrelated diagram like a general flowchart), you MUST completely reject it. Do not invent or extract random words (like "SpiderMan") into tables. Instead, you must output EXACTLY the following and nothing else:
+INVALID_DIAGRAM
 
 OUTPUT FORMAT:
 Return ONLY the raw DBML code. Do not wrap it in markdown blockquotes (```dbml ... ```). Do not provide any explanations, summaries, or conversational text. Your entire response must be valid, strict, parseable DBML."""
@@ -39,88 +42,138 @@ def generate_dbml_from_file(
     base_url: str
 ) -> tuple[str, int]:
     
-    # Process the file
-    media_type, processed_data, block_type = process_file_base64(file_base64, file_name)
+    # Generalized routing: The industry uses two main formats (Anthropic and OpenAI).
+    # If the model is a Claude model, use the native Anthropic client. 
+    # Otherwise, assume it's an OpenAI-compatible endpoint (Gemini, Groq, Mistral, Ollama, etc.)
+    is_anthropic = "claude" in llm.lower()
+    is_openai = not is_anthropic
+        
+    # Process the file (convert pdf to image if using OpenAI)
+    media_items = process_file_base64(
+        file_base64, 
+        file_name,
+        convert_pdf_to_image=is_openai
+    )
     
-    # Construct message block for Anthropic
-    content_blocks = []
-    if block_type == "text":
+    if is_openai:
+        # Setup OpenAI Client
+        client = OpenAI(api_key=llm_api_key, base_url=base_url if base_url else None)
+        
+        content_blocks = []
+        for item in media_items:
+            if item["type"] == "text":
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"Here is the SVG diagram content:\n{item['data']}"
+                })
+            elif item["type"] == "image":
+                content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{item['media_type']};base64,{item['data']}"
+                    }
+                })
+        
         content_blocks.append({
             "type": "text",
-            "text": f"Here is the SVG diagram content:\n{processed_data}"
+            "text": "Please process the above diagram according to your system instructions."
         })
-    elif block_type == "document":
-        content_blocks.append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": processed_data
-            }
-        })
-    elif block_type == "image":
-        # Ensure correct format for Anthropic (image/jpeg, image/png, image/webp, image/gif)
-        if media_type not in ["image/jpeg", "image/png", "image/webp", "image/gif"]:
-            media_type = "image/jpeg" # Fallback mapping if necessary
         
-        content_blocks.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": processed_data
-            }
-        })
-
-    # Append instruction
-    content_blocks.append({
-        "type": "text",
-        "text": "Please process the above diagram according to your system instructions."
-    })
-
-    # Setup Anthropic Client
-    if base_url:
-        client = Anthropic(api_key=llm_api_key, base_url=base_url)
+        try:
+            response = client.chat.completions.create(
+                model=llm,
+                messages=[
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {"role": "user", "content": content_blocks}
+                ],
+                max_tokens=8000
+            )
+            output_text = response.choices[0].message.content
+            tokens_used = response.usage.total_tokens if response.usage else 0
+        except Exception as e:
+            logger.error(f"Error calling Vision LLM (OpenAI): {str(e)}")
+            raise ValueError(f"Failed to process file with LLM: {str(e)}")
     else:
-        client = Anthropic(api_key=llm_api_key)
-
-    try:
-        response = client.messages.create(
-            model=llm,
-            max_tokens=8000,
-            system=VISION_SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": content_blocks
-                }
-            ]
-        )
-
-
-        # Extract text correctly (ignoring ThinkingBlock if Claude uses extended thinking)
-        output_text = ""
-        for block in response.content:
-            text = getattr(block, "text", None)
-            if getattr(block, "type", "") == "text" and isinstance(text, str):
-                output_text += text
+        # Construct message block for Anthropic
+        content_blocks = []
+        for item in media_items:
+            if item["type"] == "text":
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"Here is the SVG diagram content:\n{item['data']}"
+                })
+            elif item["type"] == "document":
+                content_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": item["media_type"],
+                        "data": item["data"]
+                    }
+                })
+            elif item["type"] == "image":
+                # Ensure correct format for Anthropic (image/jpeg, image/png, image/webp, image/gif)
+                m_type = item["media_type"]
+                if m_type not in ["image/jpeg", "image/png", "image/webp", "image/gif"]:
+                    m_type = "image/jpeg" # Fallback mapping if necessary
                 
-        # print(f"DEBUG: Extracted raw text: {output_text}")
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": m_type,
+                        "data": item["data"]
+                    }
+                })
+    
+        # Append instruction
+        content_blocks.append({
+            "type": "text",
+            "text": "Please process the above diagram according to your system instructions."
+        })
+    
+        # Setup Anthropic Client
+        if base_url:
+            client = Anthropic(api_key=llm_api_key, base_url=base_url)
+        else:
+            client = Anthropic(api_key=llm_api_key)
+    
+        try:
+            response = client.messages.create(
+                model=llm,
+                max_tokens=8000,
+                system=VISION_SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": content_blocks
+                    }
+                ]
+            )
+    
+            # Extract text correctly (ignoring ThinkingBlock if Claude uses extended thinking)
+            output_text = ""
+            for block in response.content:
+                text = getattr(block, "text", None)
+                if getattr(block, "type", "") == "text" and isinstance(text, str):
+                    output_text += text
+                    
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+        except Exception as e:
+            logger.error(f"Error calling Vision LLM (Anthropic): {str(e)}")
+            raise ValueError(f"Failed to process file with LLM: {str(e)}")
+
+    # Strip markdown code blocks if the model ignored instructions
+    output_text = output_text.strip()
+    if output_text.startswith("```"):
+        lines = output_text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        output_text = "\n".join(lines).strip()
         
-        # Strip markdown code blocks if the model ignored instructions
-        output_text = output_text.strip()
-        if output_text.startswith("```"):
-            lines = output_text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            output_text = "\n".join(lines).strip()
-        
-        tokens_used = response.usage.input_tokens + response.usage.output_tokens
-        
-        return output_text, tokens_used
-        
-    except Exception as e:
-        logger.error(f"Error calling Vision LLM: {str(e)}")
-        raise ValueError(f"Failed to process file with LLM: {str(e)}")
+    if "INVALID_DIAGRAM" in output_text or "TableGroup Unlinked {\n}" in output_text.replace(" ", ""):
+        raise ValueError("INVALID_DIAGRAM")
+    
+    return output_text, tokens_used

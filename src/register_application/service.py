@@ -62,10 +62,17 @@ def issue_access_token(db: Session, payload: TokenRequest) -> tuple[str, object]
     if not cast(bool, application.is_active):
         raise InvalidClientCredentialsError("Application is inactive")
 
-    if not verify_client_secret_key(
-        payload.client_secret_key,
-        cast(str, application.client_secret_key_hash),
-    ):
-        raise InvalidClientCredentialsError("Invalid client_id or client_secret_key")
+    try:
+        if not verify_client_secret_key(
+            payload.client_secret_key,
+            cast(str, application.client_secret_key_hash),
+        ):
+            raise InvalidClientCredentialsError("Invalid client_id or client_secret_key")
 
-    return create_access_token(str(application.id), cast(str, application.client_id))
+        return create_access_token(str(application.id), cast(str, application.client_id))
+    except InvalidClientCredentialsError:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Security error during token issuance: %s", e)
+        raise InvalidClientCredentialsError("An internal security error occurred while verifying credentials.")

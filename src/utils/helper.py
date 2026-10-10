@@ -176,8 +176,12 @@ def hash_client_secret_key(secret: str) -> str:
 
 
 def verify_client_secret_key(secret: str, stored_hash: str) -> bool:
-    calculated = hash_client_secret_key(secret)
-    return hmac.compare_digest(calculated, stored_hash)
+    try:
+        calculated = hash_client_secret_key(secret)
+        return hmac.compare_digest(calculated, stored_hash)
+    except Exception as e:
+        logger.error("Error verifying client secret key: %s", e)
+        raise AccessTokenError("Internal security error during key verification")
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -248,18 +252,21 @@ def decode_access_token(token: str) -> dict:
     return payload
 
 def decrypt_api_key(encrypted_api_key: str, encryption_key: str) -> str:
-    key = base64.b64decode(encryption_key)
-    encrypted_data = base64.b64decode(encrypted_api_key)
+    try:
+        key = base64.b64decode(encryption_key)
+        encrypted_data = base64.b64decode(encrypted_api_key)
 
-    nonce = encrypted_data[:12]
-    ciphertext_and_tag = encrypted_data[12:]
+        nonce = encrypted_data[:12]
+        ciphertext_and_tag = encrypted_data[12:]
 
-    aesgcm = AESGCM(key)
+        aesgcm = AESGCM(key)
 
-    decrypted = aesgcm.decrypt(
-        nonce,
-        ciphertext_and_tag,
-        None
-    )
-
+        decrypted = aesgcm.decrypt(
+            nonce,
+            ciphertext_and_tag,
+            None
+        )
+    except Exception as e:
+        logger.error("Error decrypting API key: %s", e)
+        raise ValueError("Failed to decrypt the configured API key due to a security or padding error")
     return decrypted.decode("utf-8")

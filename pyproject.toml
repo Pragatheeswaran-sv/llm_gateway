@@ -26,6 +26,7 @@ cryptography = "^50.0.1"
 pillow = "^12.3.0"
 apscheduler = "^3.11.3"
 pandas = "^3.0.6"
+pymupdf = "^1.28.2"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.0"

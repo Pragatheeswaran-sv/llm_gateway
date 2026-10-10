@@ -82,23 +82,28 @@ def _start_request_log(
     is_fallback_mode: bool = False,
 ) -> LLMRequestLog:
     """Create the single request log row at the start of a request."""
-    row = LLMRequestLog(
-        request_id=request_id,
-        user_prompt=user_prompt,
-        summary_enabled=summary_enabled,
-        summary=summary,
-        is_fallback_mode=is_fallback_mode,
-        provider="pending",
-        model_name="pending",
-        status="started",
-        temperature=0.1,
-        total_attempts=0,
-        failed_attempts=[],
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    try:
+        row = LLMRequestLog(
+            request_id=request_id,
+            user_prompt=user_prompt,
+            summary_enabled=summary_enabled,
+            summary=summary,
+            is_fallback_mode=is_fallback_mode,
+            provider="pending",
+            model_name="pending",
+            status="started",
+            temperature=0.1,
+            total_attempts=0,
+            failed_attempts=[],
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception as e:
+        db.rollback()
+        logger.warning("Failed to create initial request log, proceeding without logging: %s", e)
+        return None
 
 
 def _append_failed_attempt(

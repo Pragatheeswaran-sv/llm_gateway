@@ -1,11 +1,13 @@
 import base64
 import io
 import re
+import pymupdf
 from PIL import Image
 
-def process_file_base64(file_base64: str, file_name: str) -> tuple[str, str, str]:
+def process_file_base64(file_base64: str, file_name: str, convert_pdf_to_image: bool = False) -> list[dict]:
     """
-    Takes base64 string and filename, returns (media_type, processed_base64, block_type)
+    Takes base64 string and filename, returns a list of dictionaries with structure:
+    {"media_type": str, "data": str, "type": str}
     block_type will be 'image', 'document' (for pdf), or 'text' (for svg).
     """
     # Extract base64 data if it has standard data URI prefix
@@ -22,11 +24,33 @@ def process_file_base64(file_base64: str, file_name: str) -> tuple[str, str, str
     if ext == 'svg' or mime_type == 'image/svg+xml':
         # Decode SVG to plain text
         svg_text = base64.b64decode(b64_data).decode('utf-8', errors='replace')
-        return "text/plain", svg_text, "text"
+        return [{"media_type": "text/plain", "data": svg_text, "type": "text"}]
     
     if ext == 'pdf' or mime_type == 'application/pdf':
+        if convert_pdf_to_image:
+            try:
+                pdf_bytes = base64.b64decode(b64_data)
+                doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                if len(doc) == 0:
+                    raise ValueError("PDF is empty")
+                
+                results = []
+                # Process up to 10 pages to avoid token/memory overload
+                max_pages = min(len(doc), 10)
+                for page_num in range(max_pages):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(dpi=150)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    
+                    out_buffer = io.BytesIO()
+                    img.save(out_buffer, format="PNG")
+                    page_b64 = base64.b64encode(out_buffer.getvalue()).decode('utf-8')
+                    results.append({"media_type": "image/png", "data": page_b64, "type": "image"})
+                return results
+            except Exception as e:
+                raise ValueError(f"Failed to process PDF into image(s): {str(e)}")
         # Claude supports PDF natively
-        return "application/pdf", b64_data, "document"
+        return [{"media_type": "application/pdf", "data": b64_data, "type": "document"}]
         
     # Assume image for the rest (png, jpg, webp)
     try:
@@ -56,7 +80,7 @@ def process_file_base64(file_base64: str, file_name: str) -> tuple[str, str, str
             else:
                 mime_type = f"image/{fmt}"
             
-        return mime_type, b64_data, "image"
+        return [{"media_type": mime_type, "data": b64_data, "type": "image"}]
 
     except Exception as e:
         raise ValueError(f"Failed to process image: {str(e)}")

@@ -1,4 +1,8 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status, HTTPException
+import logging
+from src.utils.errors import get_user_friendly_error
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
 
 from src.config import settings
@@ -25,32 +29,38 @@ def _run_export_in_background():
 @router.get("/status")
 def get_export_status():
     """Return the current export configuration."""
-    return {
-        "message": "Export configuration retrieved",
-        "status_code": status.HTTP_200_OK,
-        "data": {
-            "export_interval_hours": settings.EXPORT_INTERVAL_HOURS,
-            "recipient_email": settings.ALERT_EMAIL_RECIPIENT,
-            "smtp_host": settings.SMTP_HOST,
-            "smtp_port": settings.SMTP_PORT,
-            "smtp_user": settings.SMTP_USER,
-        },
-    }
+    try:
+        return {
+            "message": "Export configuration retrieved",
+            "status_code": status.HTTP_200_OK,
+            "data": {
+                "export_interval_hours": settings.EXPORT_INTERVAL_HOURS,
+                "recipient_email": settings.ALERT_EMAIL_RECIPIENT,
+                "smtp_host": settings.SMTP_HOST,
+                "smtp_port": settings.SMTP_PORT,
+                "smtp_user": settings.SMTP_USER,
+            },
+        }
+    except Exception as e:
+        logger.error("Error retrieving export status: %s", e)
+        raise HTTPException(status_code=500, detail=get_user_friendly_error(e))
 
 
 @router.post("/trigger", status_code=status.HTTP_202_ACCEPTED)
 def trigger_log_export(background_tasks: BackgroundTasks):
     """
     Manually trigger an immediate log export for the last N hours.
-    Returns 202 immediately; export runs in the background.
-    Check server logs for the result.
     """
-    background_tasks.add_task(_run_export_in_background)
-    return {
-        "message": "Log export triggered successfully. Running in background.",
-        "status_code": status.HTTP_202_ACCEPTED,
-        "data": {
-            "export_interval_hours": settings.EXPORT_INTERVAL_HOURS,
-            "recipient_email": settings.ALERT_EMAIL_RECIPIENT,
-        },
-    }
+    try:
+        background_tasks.add_task(_run_export_in_background)
+        return {
+            "message": "Log export triggered successfully. Running in background.",
+            "status_code": status.HTTP_202_ACCEPTED,
+            "data": {
+                "export_interval_hours": settings.EXPORT_INTERVAL_HOURS,
+                "recipient_email": settings.ALERT_EMAIL_RECIPIENT,
+            },
+        }
+    except Exception as e:
+        logger.error("Error triggering log export: %s", e)
+        raise HTTPException(status_code=500, detail=get_user_friendly_error(e))

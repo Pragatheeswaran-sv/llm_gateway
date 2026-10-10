@@ -26,27 +26,26 @@ def run_scheduled_export_job():
 
 def start_scheduler():
     """Initialize and start the background APScheduler."""
-    if not scheduler.running:
-        scheduler.add_job(
-            run_scheduled_export_job,
-            "interval",
-            hours=settings.EXPORT_INTERVAL_HOURS,
-            id="log_export_job",
-            replace_existing=True,
-        )
-        scheduler.start()
-        logger.info("APScheduler started: exporting logs every %d hours.", settings.EXPORT_INTERVAL_HOURS)
+    try:
+        if not scheduler.running:
+            scheduler.add_job(
+                run_scheduled_export_job,
+                "interval",
+                hours=settings.EXPORT_INTERVAL_HOURS,
+                id="log_export_job",
+                replace_existing=True,
+            )
+            scheduler.start()
+            logger.info("APScheduler started: exporting logs every %d hours.", settings.EXPORT_INTERVAL_HOURS)
+    except Exception as e:
+        logger.error("Failed to start the background scheduler: %s", e)
 
 
 def shutdown_scheduler():
     """Shutdown the APScheduler background process."""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("APScheduler shutdown completed.")
-
-
-def shutdown_scheduler():
-    """Shutdown the APScheduler background process."""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("APScheduler shutdown completed.")
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("APScheduler shutdown completed.")
+    except Exception as e:
+        logger.error("Failed to cleanly shutdown the background scheduler: %s", e)

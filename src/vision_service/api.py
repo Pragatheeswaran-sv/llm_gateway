@@ -47,9 +47,25 @@ def generate_from_file_api(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid API key.")
 
-    # Image Resolution Validation (Skip for PDFs)
+    # Strict File Validation
+    supported_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.pdf', '.svg')
+    supported_prefixes = ("data:image/", "data:application/pdf", "data:image/svg+xml")
+    
+    is_valid_format = False
+    if request.file_name and request.file_name.lower().endswith(supported_extensions):
+        is_valid_format = True
+    elif request.file_base64 and any(request.file_base64.startswith(prefix) for prefix in supported_prefixes):
+        is_valid_format = True
+        
+    if not is_valid_format:
+        raise HTTPException(
+            status_code=400, 
+            detail="Unsupported file format. Only PNG, JPG, JPEG, WEBP, GIF, SVG, and PDF files are supported."
+        )
+
+    # Image Check
     is_image = False
-    if request.file_base64.startswith("data:image/"):
+    if request.file_base64.startswith("data:image/") and not request.file_base64.startswith("data:image/svg+xml"):
         is_image = True
     elif request.file_name and request.file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
         is_image = True
@@ -62,12 +78,7 @@ def generate_from_file_api(
         try:
             image_data = base64.b64decode(b64_str)
             with Image.open(io.BytesIO(image_data)) as img:
-                width, height = img.size
-                if width < 800 or height < 600:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Image resolution too low ({width}x{height}). Please upload a clearer image of at least 800x600 pixels to prevent data hallucinations."
-                    )
+                img.verify() # Just verify it is a valid, uncorrupted image file
         except Exception as e:
             if isinstance(e, HTTPException):
                 raise e
@@ -115,4 +126,6 @@ def generate_from_file_api(
         db.commit()
         
         user_message = get_user_friendly_error(e)
+        if "valid database diagram" in user_message or "API key does not have access" in user_message:
+            raise HTTPException(status_code=400, detail=user_message)
         raise HTTPException(status_code=500, detail=user_message)
